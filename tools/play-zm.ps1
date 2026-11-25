@@ -36,7 +36,7 @@ param(
   [switch]$Ram32,                                  # zm0kie: 32 GB PC profile (smaller pools)
   [string]$Env = '',                               # zm0kie: extra variables 'NAME=value;NAME2=value'
   [switch]$Dred,                                   # zm0kie: device-removed report (DRED breadcrumbs, page fault, per-command pipeline hashes)
-  [switch]$SafeIndirect                            # zm0kie: VICTORY_INDIRECT_RAW=3, the game's own draw arguments only when the CPU checked them
+  [switch]$RawIndirect                             # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
 )
 if (-not (Test-Path -LiteralPath $Game)) { "Not found: $Game"; exit 1 }
 $set = [ordered]@{
@@ -68,7 +68,7 @@ $set = [ordered]@{
   VICTORY_LIST_POOL_MB        = '2048'
   VICTORY_WIDE_THREADS        = '12'
   VICTORY_UNDER_WRITES_MASKS_LEAST = '1'   # small changes go up in one pass per buffer
-  VICTORY_INDIRECT_RAW        = $(if ($SafeIndirect) { '3' } else { '2' })  # indirect draws use the game's own arguments
+  VICTORY_INDIRECT_RAW        = $(if ($RawIndirect) { '2' } else { '3' })  # indirect draws use the game's own arguments
   VICTORY_TEXTURE_HASH_EVERY  = '32'
   # added 2026-11-25 noon
   VICTORY_LEVELS_ON_DEMAND    = '1'         # a texture takes the card's memory only for the mip levels the game holds
