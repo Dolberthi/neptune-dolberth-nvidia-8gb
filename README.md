@@ -24,6 +24,16 @@ This port checks every such record on the CPU first. Sane records run as fast as
 
 <br>
 
+## ◆ Ryzen notes
+
+| | |
+|:--|:--|
+| **Console instructions** | The Xbox CPU is a Zen 2. Instructions Intel lacks (`MONITORX`, `MWAITX`, `CLZERO`, `INSERTQ`) have to be emulated on Intel. A Ryzen has them in hardware. |
+| **Indirect draws** | `VICTORY_INDIRECT_RAW=3` is the default: argument records are checked on the CPU before the GPU runs them. `-RawIndirect` brings back upstream's mode. |
+| **32 GB RAM** | Upstream was tuned on 64 GB. `-Ram32` shrinks the list pool, the texture staging and the card copies. |
+
+<br>
+
 ## ◆ Quick start
 
 > [!IMPORTANT]
@@ -48,6 +58,42 @@ This port checks every such record on the CPU first. Sane records run as fast as
 
 <br>
 
+## ◆ Under the hood
+
+<details>
+<summary><b>Where a frame goes</b> &nbsp;·&nbsp; open world, about 6,500 draws, 90 ms (upstream measurement)</summary>
+<br>
+
+| Part | Share |
+|:--|--:|
+| Render thread in the submit step (memory copies, heap sync, write watch, textures) | ~41 % |
+| Render thread waiting for the game's recording threads | ~48 % |
+| Game's own code on the render thread | ~11 % |
+| GPU busy | 35 % |
+
+The CPU side is the limit, not the GPU.
+
+</details>
+
+<details>
+<summary><b>Switches worth knowing</b></summary>
+<br>
+
+| Switch | Default | Does |
+|:--|:--|:--|
+| `VICTORY_AMBIENT` | `0.6` | ambient light level in place of ray-traced light; `off` disables it |
+| `VICTORY_PIPELINE_WAIT_MS` | `2500` | longest a frame waits for a shader still compiling |
+| `VICTORY_LEVELS_ON_DEMAND` | `1` | textures take card memory only for the mip levels in use |
+| `VICTORY_VRAM_IDLE_MS` | `15000,2500,1000` | how long an unused texture stays on the card |
+| `VICTORY_HEAP_SYNC` | `1` | mirrors descriptor records the game copies as bytes |
+| `VICTORY_INDIRECT_RAW` | `3` | `0` clamp all, `2` trust all, `3` check on the CPU |
+
+Pass any of them with `-Env 'NAME=value'`. Changing the shader translator or its switches needs a new `-Warm`.
+
+</details>
+
+<br>
+
 ## ◆ Build
 
 ```powershell
@@ -69,7 +115,7 @@ Needs Visual Studio Build Tools (MSVC + Windows SDK) and [rustup](https://rustup
 ## ◆ Credits
 
 **Traffic** &amp; **imgone** for Neptune, the base of this port.
-Built on Marvisak/VIctory, myokex, fxceless, soldsawn, Belobug, ZSlayerHQ, JoshuuDev and more, see [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt).
+Built on Marvisak/VIctory · fxceless &amp; myokex (base, levels on demand, heap sync; PRs by Jonirulah, Flyander, AscilCH) · soldsawn (shader translator) · Belobug &amp; ShakiraRED-dt (ambient pass) · ZSlayerHQ · JoshuuDev · skornuta · Trexies · the DexNom FidelityFX patch. Full list in [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt).
 Port by **zm0kie**.
 
 <br>
