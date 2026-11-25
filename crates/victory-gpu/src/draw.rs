@@ -218,6 +218,39 @@ fn raw_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RAW").is_some_and(|v| v == "2"))
 }
 
+/// (Neptune) `VICTORY_INDIRECT_RAW=3`: like 2 for single draws and indexed draws whose record
+/// the CPU can read, that no shader has written in this frame or the two before, and that
+/// look sane; every other indirect call goes the clamped way.
+fn raw_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RAW").is_some_and(|v| v == "3"))
+}
+
+/// (Neptune) Single draws under `VICTORY_INDIRECT_RAW=3`, since the last frame line: drawn
+/// as the title wrote them after the CPU checked the record, left to the clamp because
+/// shaders may write the record, because the record failed the check, because it could
+/// not be read.
+pub(crate) static RAW3: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// (Neptune) Whether the record of a draw (`kind` 0) or indexed draw (1) at title address `at`
+/// asks for something that can run: counts up to 2^24 (their product up to 2^26) and starts
+/// below 2^28. `None` if it cannot be read.
+/// shortcut: the buffers the starts index are not looked at, and the record is read now, not
+/// when the list runs.
+fn record_sane(kind: u32, at: u64) -> Option<bool> {
+    let mut b = [0u8; 20];
+    let n = if kind == 1 { 20 } else { 16 };
+    if !crate::host::read_into(at as *const u8, &mut b[..n]) {
+        return None;
+    }
+    let w = |i: usize| u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+    const CAP: u32 = 1 << 24;
+    const START: u32 = 1 << 28;
+    let (count, instances) = (w(0), w(1));
+    let starts = if kind == 1 { w(2).max((w(3) as i32).unsigned_abs()).max(w(4)) } else { w(2).max(w(3)) };
+    Some(count <= CAP && instances <= CAP && u64::from(count) * u64::from(instances) <= 1 << 26 && starts < START)
+}
+
 fn raw_indirect() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RAW").is_some_and(|v| v == "1"))
@@ -3318,7 +3351,21 @@ impl State {
         // (`VICTORY_INDIRECT_RAW=2`: also dispatches and records with a count, as the title
         // gave them; not a dispatch that is split into parts for its first group's number.)
         let split = kind == DISPATCH && max == 1 && count.is_none() && group_base(p).is_some();
-        if raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split {
+        let trusted = raw_guard() && matches!(kind, DRAW | INDEXED) && max == 1 && count.is_none() && {
+            let n = if kind == INDEXED { 20 } else { 16 };
+            let slot = if list.gpu_written(arguments as usize, n) || crate::host::shader_written(arguments as usize, n) {
+                1
+            } else {
+                match record_sane(kind, arguments) {
+                    Some(true) => 0,
+                    Some(false) => 2,
+                    None => 3,
+                }
+            };
+            RAW3[slot].fetch_add(1, Ordering::Relaxed);
+            slot == 0
+        };
+        if (raw_all() || trusted) && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split {
             self.window = None;
             args.refresh(list, arguments, len);
             if let Some((s, at)) = &counter {

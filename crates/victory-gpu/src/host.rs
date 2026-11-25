@@ -8201,6 +8201,12 @@ impl Meter {
             tracing::info!(
                 "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2)"
             );
+            let [ok, written, bad, unread] = [0, 1, 2, 3].map(|i| crate::draw::RAW3[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if ok + written + bad + unread > 0.0 {
+                tracing::info!(
+                    "VICTORY_INDIRECT_RAW=3 single draws per frame: {ok:.0} raw (record checked on the CPU), {written:.0} clamped (shaders may write the record), {bad:.0} clamped (record failed the check), {unread:.0} clamped (unreadable)"
+                );
+            }
         }
         if census_on() {
             let census = CENSUS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
