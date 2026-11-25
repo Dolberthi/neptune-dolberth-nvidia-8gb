@@ -2239,7 +2239,6 @@ impl State {
             }
             return;
         }
-        #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
@@ -2265,6 +2264,13 @@ impl State {
         if self.ambient(list, p) {
             self.replay(list);
         }
+    }
+
+    /// What a draw or dispatch runs, for the device-removed report (release
+    /// builds, `VICTORY_D3D12_DRED`): the kind and the pipeline's shaders.
+    #[cfg(not(feature = "diagnostics"))]
+    fn op_text(&self, kind: String, _compute: bool) -> String {
+        format!("{kind} {}", crate::pipeline::shaders_of(self.pipeline as This))
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2531,7 +2537,6 @@ impl State {
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
@@ -3016,7 +3021,6 @@ impl State {
             } else {
                 (vertices, first)
             };
-            #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
@@ -3119,7 +3123,6 @@ impl State {
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
-            #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
@@ -3289,7 +3292,6 @@ impl State {
                 why("prepare failed");
                 return false;
             }
-            #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), false));
             // SAFETY: an open list with everything set; the list keeps the host copy
             // alive, and the signature is cached.
@@ -3331,7 +3333,6 @@ impl State {
                 why("prepare failed");
                 return false;
             }
-            #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH));
             if kind == MESH {
                 self.mesh_scissor(list, true);
@@ -3382,7 +3383,6 @@ impl State {
                     why("prepare failed");
                     return false;
                 }
-                #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), false));
                 if kind == MESH {
                     self.mesh_scissor(list, true);
@@ -3500,7 +3500,6 @@ impl State {
             why("prepare failed");
             return false;
         }
-        #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });

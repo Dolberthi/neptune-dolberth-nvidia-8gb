@@ -620,9 +620,13 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
-    // Tests have no log: the reason goes to their output.
-    #[cfg(test)]
-    eprintln!("host GPU failure: {text}");
+    // The launcher redirects stderr to a file; the DRED report must reach it.
+    if dred_on() || cfg!(test) {
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "host GPU failure: {text}");
+        let _ = err.flush();
+    }
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -906,7 +910,6 @@ pub(crate) struct HostList {
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
-    #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
@@ -932,8 +935,7 @@ fn lazy_prelude() -> bool {
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
 
-/// A marker's text and the host range its command reads (diagnostics).
-#[cfg(feature = "diagnostics")]
+/// A marker's text and the host range its command reads.
 type Note = (String, Option<(u64, u64)>);
 
 type States = std::collections::HashMap<
@@ -1518,12 +1520,12 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed data is on (`VICTORY_D3D12_DRED`): breadcrumbs, the
+/// page fault, and a marker naming each draw, dispatch and copy.
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
 }
 
@@ -4169,7 +4171,6 @@ impl Host {
                 indirect_args: Mutex::default(),
                 ahead_chunks: Mutex::default(),
                 _alive: Counted::new(),
-                #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
@@ -6300,14 +6301,21 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                    let queue = p.pCommandQueue.as_ref().map(|q| q.as_raw());
+                    let queue_name = if queue == Some(self.queue.as_raw()) {
+                        "the main queue".to_owned()
+                    } else if p.pCommandQueueDebugNameW.is_null() {
+                        format!("another queue {queue:?}")
+                    } else {
+                        format!("queue {:?} {queue:?}", p.pCommandQueueDebugNameW.to_string().unwrap_or_default())
+                    };
                     text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
+                        "; a list on {queue_name} stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.
-                    #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
                         let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
                         history
@@ -6321,10 +6329,6 @@ impl Host {
                             })
                             .collect()
                     });
-                    #[cfg(not(feature = "diagnostics"))]
-                    let markers: Vec<(u32, String)> = Vec::new();
-                    #[cfg(not(feature = "diagnostics"))]
-                    let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
                     } else if let Some(r) = run {
@@ -6515,7 +6519,6 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
@@ -6907,32 +6910,35 @@ impl HostList {
     /// command whose text the list keeps (diagnostics, with device-removed
     /// data on): the report pairs the breadcrumbs' marker commands with the
     /// texts in order and names the commands a fault stopped among.
-    #[cfg(feature = "diagnostics")]
     pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
         self.note(what, None);
     }
 
     /// As [`HostList::note_op`], for a copy that reads the host GPU range
     /// `(address, bytes)`: the report places the faulting address in it.
-    #[cfg(feature = "diagnostics")]
     pub(crate) fn note_read(&self, what: impl FnOnce() -> String, range: (u64, u64)) {
         self.note(what, Some(range));
     }
 
-    #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if !dred_on() {
+            #[cfg(feature = "diagnostics")]
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
         {
+            #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            #[cfg(feature = "diagnostics")]
+            {
+                let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+                if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+                    // SAFETY: an open list and our query heap.
+                    unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+                }
             }
             let what = what();
+            #[cfg(feature = "diagnostics")]
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -6944,6 +6950,7 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+            #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::NoteNs, started.elapsed().as_nanos() as u64);
         }
     }
@@ -9073,27 +9080,18 @@ impl Host {
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
 fn last_notes(runs: &[&HostList]) -> String {
-    #[cfg(feature = "diagnostics")]
-    {
-        let mut text = String::new();
-        for (i, r) in runs.iter().enumerate() {
-            let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
-            for (n, _) in notes.iter().rev().take(6).rev() {
-                text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
-            }
+    let mut text = String::new();
+    for (i, r) in runs.iter().enumerate() {
+        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, _) in notes.iter().rev().take(6).rev() {
+            text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
         }
-        text
     }
-    #[cfg(not(feature = "diagnostics"))]
-    {
-        let _ = runs;
-        String::new()
-    }
+    text
 }
 
 /// Where the faulting address `va` lies against a range `(start, bytes)` a
-/// command reads (diagnostics).
-#[cfg(feature = "diagnostics")]
+/// command reads.
 fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
     let end = start + bytes;
     if va < start {
@@ -9119,10 +9117,17 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .map_or(history.len(), |b| (done + b).max(done + 1));
     let mut text = format!(", commands {from}..{to} between its barriers:");
     let mut shown = 0;
-    // From just before the command the GPU had not finished: the first
-    // twelve after the barrier named draws long done when a list of 79
-    // mesh draws stopped at its 45th (run 41).
-    for i in from.max(done.saturating_sub(4))..to {
+    // From the 5 commands (markers apart) before the one the GPU had not
+    // finished: the first twelve after the barrier named draws long done
+    // when a list of 79 mesh draws stopped at its 45th (run 41).
+    let (mut start, mut back) = (done, 0);
+    while start > 0 && back < 5 {
+        start -= 1;
+        if history[start] != D3D12_AUTO_BREADCRUMB_OP_SETMARKER {
+            back += 1;
+        }
+    }
+    for i in start.min(from)..to {
         let op = history[i];
         if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
             continue;

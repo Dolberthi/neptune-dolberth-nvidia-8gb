@@ -34,7 +34,8 @@ param(
   [switch]$FrametimeDump,                         # writes <cache>\frametime.csv (a row a second)
   [switch]$Stats, [string]$Tag = '',               # zm0kie: log + memory samples D:\Neptune-VE-c\stats<Tag>.log / memwatch<Tag>.csv
   [switch]$Ram32,                                  # zm0kie: 32 GB PC profile (smaller pools)
-  [string]$Env = ''                                # zm0kie: extra variables 'NAME=value;NAME2=value'
+  [string]$Env = '',                               # zm0kie: extra variables 'NAME=value;NAME2=value'
+  [switch]$Dred                                    # zm0kie: device-removed report (DRED breadcrumbs, page fault, per-command pipeline hashes)
 )
 if (-not (Test-Path -LiteralPath $Game)) { "Not found: $Game"; exit 1 }
 $set = [ordered]@{
@@ -145,6 +146,7 @@ if (-not $SeriesX) {
 $set['VICTORY_DISCORD'] = '0'
 if ($Ram32) { $set['VICTORY_LIST_POOL_MB'] = '512'; $set['VICTORY_LIST_POOL_MOST'] = '1024'; $set['VICTORY_TEXTURE_STAGE_MB'] = '256'; $set['VICTORY_CARD_WINDOWS_MB'] = '3072' }
 foreach ($pair in ($Env -split ';')) { if ($pair -match '^\s*([A-Z0-9_]+)\s*=\s*(.*)$') { $set[$Matches[1]] = $Matches[2] } }
+if ($Dred) { $set['VICTORY_D3D12_DRED'] = '1' }
 foreach ($k in $set.Keys) { Set-Item -Path ("Env:" + $k) -Value $set[$k] }
 # The game's folder, for the shader translation (no config file needed).
 $env:VICTORY_GAME_DIR = Split-Path -Parent (Resolve-Path -LiteralPath $Game)
