@@ -1,97 +1,79 @@
-<div align="center">
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="Neptune VI" width="100%">
+</p>
 
-# Neptune VI
+<p align="center">
+  <img src="https://img.shields.io/badge/Windows%2011-0b0a15?style=flat-square&logo=windows11&logoColor=white" alt="Windows 11">
+  <img src="https://img.shields.io/badge/Ryzen%207%209800X3D-0b0a15?style=flat-square&logo=amd&logoColor=ed1c24" alt="Ryzen 7 9800X3D">
+  <img src="https://img.shields.io/badge/RTX%205070%20Ti-0b0a15?style=flat-square&logo=nvidia&logoColor=76b900" alt="RTX 5070 Ti">
+  <img src="https://img.shields.io/badge/GPL--3.0-0b0a15?style=flat-square&logo=gnu&logoColor=white" alt="GPL-3.0">
+</p>
 
-**The Neptune runtime for GTA VI, ported to an AMD Ryzen + NVIDIA PC.**
+<p align="center">
+  Runs the Xbox Series build of <b>GTA VI</b> on a Windows PC.<br>
+  A port of <b>Neptune (VIctory Edit.)</b> by <b>Traffic</b> &amp; <b>imgone</b> for AMD Ryzen + NVIDIA.
+</p>
 
-A port of *Neptune (VIctory Edit.)* by **Traffic** and **imgone**, built and tested on a Ryzen 7 9800X3D.
+<br>
 
-![platform](https://img.shields.io/badge/platform-Windows%2011-0b0b0b?style=flat-square)
-![cpu](https://img.shields.io/badge/CPU-Ryzen%207%209800X3D-ed1c24?style=flat-square)
-![gpu](https://img.shields.io/badge/GPU-RTX%205070%20Ti-76b900?style=flat-square)
-![license](https://img.shields.io/badge/license-GPL--3.0-1f6feb?style=flat-square)
-![status](https://img.shields.io/badge/status-work%20in%20progress-8a8a8a?style=flat-square)
+## ◆ Why this port
 
-</div>
+Upstream froze the GPU right before the first gameplay scene on a Ryzen 7 9800X3D with an RTX 5070 Ti. The cause: the game's indirect draw arguments ran unchecked, and some of them hold garbage.
 
----
+This port checks every such record on the CPU first. Sane records run as fast as before, broken ones go through the safe path. **The game now gets into gameplay.**
 
-## What this is
+<br>
 
-Neptune runs the Xbox Series executable of GTA VI on a Windows PC. It translates the console's graphics calls to Direct3D 12, its shaders to DXIL, and emulates the console's unified memory on top of separate RAM and VRAM.
+## ◆ Quick start
 
-This repository is a port of Neptune for one specific setup: an AMD Ryzen CPU with an NVIDIA RTX card. Upstream's build hung the GPU at the first gameplay scene on this machine. The fix is in here, along with a launcher tuned for 32 GB of RAM.
-
-> **No game files are included.** You need your own copy of the game. Shaders are translated on your PC from that copy.
-
-## What changed in this port
-
-| | |
-|---|---|
-| **GPU hang fixed** | Upstream runs the game's indirect draw arguments unchecked (`VICTORY_INDIRECT_RAW=2`). Some of those records hold garbage, and on this PC one of them hung the GPU before the first gameplay scene. The new mode `VICTORY_INDIRECT_RAW=3` checks each record on the CPU first. Sane records still run directly. Garbage records, and records the GPU writes itself, go through the safe clamp path. This mode is the default here. |
-| **32 GB profile** | `-Ram32` shrinks the list pool, the texture staging and the draw data kept on the card. Upstream's switch set was tuned on a 64 GB machine. |
-| **GPU hang reports** | `VICTORY_D3D12_DRED=1` (launcher `-Dred`) works in the normal release build. When the GPU fails, the log names the command list, the command it stopped at, and the shaders involved. |
-| **Logging** | `-Stats -Tag <name>` writes the log and a memory curve straight to files, without PowerShell in between. |
-
-## Quick start
-
-Requirements: Windows 11, a current GPU driver, a 16 GB graphics card, your own copy of the game.
+> [!IMPORTANT]
+> No game files are included. You need your own copy of the game.
 
 ```powershell
-# first run: translates the shaders (about 7 minutes), then starts the game
-.\play-zm.ps1 -Game 'D:\path\to\game_scarlett_master.exe' -SeriesX -Ram32 -Warm
+# first launch: translates the shaders (~7 min), then starts the game
+.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Ram32 -Warm
 
-# after that
-.\play-zm.ps1 -Game 'D:\path\to\game_scarlett_master.exe' -SeriesX -Ram32
+# every launch after that
+.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Ram32
 ```
 
-| Switch | Does |
-|---|---|
-| `-SeriesX` | the 4K Series X path |
-| `-Ram32` | the profile for 32 GB of RAM |
-| `-Stats -Tag x` | log and memory samples as `statsx.log` and `memwatchx.csv` |
-| `-Dred` | names the failing GPU command when the GPU hangs |
-| `-RawIndirect` | upstream's unchecked indirect draws (hung the GPU here) |
-| `-Env 'NAME=value;...'` | any extra `VICTORY_*` setting |
+| Switch | |
+|:--|:--|
+| `-SeriesX` | 4K Series X path |
+| `-Ram32` | profile for 32 GB RAM |
+| `-Stats -Tag x` | log + memory curve to files |
+| `-Dred` | names the shader when the GPU hangs |
 
-Upstream's own launcher is still there as `tools/play.ps1`, with its options for the Series S path, OptiScaler and frame generation.
+**Controls** · F9 mouse look · WASD move · Enter / Backspace / X / Y as A / B / X / Y · F10 overlay · F12 screenshot
 
-**Controls:** click the picture or press F9 for mouse look. WASD to move, Enter/Backspace/X/Y for A/B/X/Y. F10 hides the overlay, F12 saves a screenshot.
+<br>
 
-## Building
-
-Needs Git, the Visual Studio Build Tools (MSVC C++ and a Windows SDK) and [rustup](https://rustup.rs).
+## ◆ Build
 
 ```powershell
 cargo build --release -p victory
 ```
 
-The executable lands in `target\release\victory.exe`. Put it in one folder together with `tools\play-zm.ps1` and start the game from there.
+Needs Visual Studio Build Tools (MSVC + Windows SDK) and [rustup](https://rustup.rs). Put `target\release\victory.exe` next to `tools\play-zm.ps1`.
 
-## Known limits
+<br>
 
-- **Lighting:** the game lights rooms and reflections with ray tracing, which no build of this runtime runs yet. An ambient pass stands in for it, so ceilings can stay dark and water can look off.
-- **Frame rate:** frames drop while the game streams the world, and frame time jumps while moving fast.
-- **Hardware:** tested on one PC only (Ryzen 7 9800X3D, RTX 5070 Ti 16 GB, 32 GB RAM, Windows 11).
+## ◆ Known limits
 
-## Credits
+- Ray-traced light is not running yet. An ambient pass stands in, so some rooms and water look off.
+- Frame rate dips while the world streams in.
+- Tested on one PC: Ryzen 7 9800X3D · RTX 5070 Ti 16 GB · 32 GB RAM.
 
-This port stands entirely on other people's work:
+<br>
 
-- **Traffic** and **imgone**: Neptune (VIctory Edit.), the base of this port
-- **Marvisak/VIctory**: the original runtime
-- **myokex/victory-amd**, **fxceless/victory-fork**: the base Neptune builds on
-- **soldsawn/victory-nvidia-8gb**: the shader translator
-- **Belobug**, **reddxd-byte/ShakiraRED-dt**: the ambient light pass
-- **ZSlayerHQ**, **JoshuuDev**, **skornuta**, **Trexies**, and everyone listed in [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt)
-- **zm0kie**: this port
+## ◆ Credits
 
-The upstream readmes are kept in [`docs/`](docs/).
+**Traffic** &amp; **imgone** for Neptune, the base of this port.
+Built on Marvisak/VIctory, myokex, fxceless, soldsawn, Belobug, ZSlayerHQ, JoshuuDev and more, see [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt).
+Port by **zm0kie**.
 
-## License
+<br>
 
-GPL-3.0-or-later, see [`LICENSE`](LICENSE). If you pass this on, pass on the source with it.
-
-<div align="center">
-<sub>Not affiliated with Rockstar Games, Take-Two Interactive or Microsoft.</sub>
-</div>
+<p align="center">
+  <sub>GPL-3.0-or-later · not affiliated with Rockstar Games, Take-Two Interactive or Microsoft</sub>
+</p>
