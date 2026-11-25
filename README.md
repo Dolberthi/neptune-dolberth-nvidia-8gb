@@ -58,6 +58,19 @@ This port checks every such record on the CPU first. Sane records run as fast as
 
 <br>
 
+## ◆ Overlay &amp; screenshots
+
+A small translucent performance panel by **zm0kie** sits in the top-left corner of the game window. It shows FPS and frame time, the high, low and average of the last 30 seconds, draws per frame, CPU and GPU load, RAM and VRAM, and your hardware.
+
+| Key | |
+|:--|:--|
+| `F10` | show / hide the overlay |
+| `F12` | save a screenshot to `Pictures\Neptune` (with the overlay in the picture while it is shown) |
+
+`VICTORY_OVERLAY=0` turns it off completely.
+
+<br>
+
 ## ◆ Under the hood
 
 <details>
