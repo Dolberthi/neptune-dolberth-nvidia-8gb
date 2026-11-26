@@ -309,9 +309,10 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    // (Neptune) Half the processors unless told: the title's five recording threads only
-    // write now, and the thread that runs the lines and its helpers want the rest.
-    let usual = std::thread::available_parallelism().map_or(8, |n| n.get() / 2).clamp(4, 16);
+    // (Neptune) One-third of logical processors (2..=8) unless overridden:
+    // avoids oversubscribing 4C-6C CPUs alongside WIDE/TURBO/title threads,
+    // while still scaling up on 8C-16C CPUs.
+    let usual = std::thread::available_parallelism().map_or(4, |n| n.get() / 3).clamp(2, 8);
     let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(usual).clamp(1, 32);
     for i in 0..threads {
         let worker = move || {

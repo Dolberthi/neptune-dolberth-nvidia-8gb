@@ -65,6 +65,25 @@ pub(crate) fn keep_helper_on_fast_cores(what: &str) {
     ask(what, 2);
 }
 
+/// Raises a critical frame-path thread (`victory-submit`, `victory-ahead`) one
+/// step (`THREAD_PRIORITY_ABOVE_NORMAL`) inside a normal-priority process so
+/// helper pools and background pipeline workers do not preempt it. On by
+/// default; `VICTORY_FRAME_PRIORITY=0` disables it.
+pub(crate) fn prioritize_frame_thread(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_FRAME_PRIORITY").is_none_or(|v| v != "0")) {
+        return;
+    }
+    // SAFETY: a plain call on our own thread.
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    if ok == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "could not raise frame thread priority");
+    } else {
+        tracing::info!(what, "frame thread running at ABOVE_NORMAL priority (VICTORY_FRAME_PRIORITY=0: normal)");
+    }
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
     if stage() < from {

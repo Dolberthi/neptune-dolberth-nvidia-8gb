@@ -393,6 +393,11 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    // DXIL translation is light and scales across every thread, whereas
+    // concurrent driver compute-pipeline compiles can spike RAM on 16 GB PCs
+    // and trigger SSD paging: cap driver compiles to half the threads (2..=6).
+    let max_driver_compiles = (threads / 2).clamp(2, 6);
+    let driver_gate = (Mutex::new(0usize), std::sync::Condvar::new());
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
     let started = std::time::Instant::now();
@@ -430,7 +435,22 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                             });
                             let Some(stage) = stage else { continue };
                             let compute = pipelines && stage == "compute";
-                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+                            let (translated, pipeline) = if compute {
+                                let mut active = lock(&driver_gate.0);
+                                while *active >= max_driver_compiles {
+                                    active = driver_gate.1.wait(active).unwrap_or_else(|e| e.into_inner());
+                                }
+                                *active += 1;
+                                drop(active);
+                                let res = victory_hle::modules::d3d12x::warm(stage, bytes, true);
+                                let mut active = lock(&driver_gate.0);
+                                *active = active.saturating_sub(1);
+                                drop(active);
+                                driver_gate.1.notify_one();
+                                res
+                            } else {
+                                victory_hle::modules::d3d12x::warm(stage, bytes, false)
+                            };
                             let count = if translated { &done } else { &refused };
                             let n = count.fetch_add(1, Ordering::Relaxed) + 1;
                             match pipeline {

@@ -561,6 +561,14 @@ fn record_gpu_clamp(
         ),
     ];
     let skip = usize::from(!waits);
+    // (Neptune) `VICTORY_CLAMP_WAITS=0`: no wait for every shader write after the clamp, only
+    // the state change of its records (which waits for the clamp's own writes to them).
+    // Between the wait before the clamp and this one the clamp is all that runs; the budget
+    // it writes is read by the next clamp, after that one's own wait for every shader write,
+    // or on the CPU once the card is done. After victory-scarlett f748fb557a / Trexies 6b358fe
+    // as measured by lordon1a/victory-laptop-8gb (8 GB NVIDIA, 16 GB RAM: 149 -> 143 ms,
+    // the picture the same).
+    let second_from = if clamp_waits_global() { skip } else { 1 };
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -574,8 +582,15 @@ fn record_gpu_clamp(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(groups, 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[second_from..]);
     }
+}
+
+/// (Neptune) Whether a clamp ends with a wait for every shader write (the default);
+/// `VICTORY_CLAMP_WAITS=0`: with the change of its records' state alone.
+fn clamp_waits_global() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAITS").is_none_or(|v| v != "0"))
 }
 
 /// (Neptune) A record clamped ahead of its list ([`record_ahead`]): the

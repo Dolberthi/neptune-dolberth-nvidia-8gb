@@ -740,28 +740,49 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // Write numbers are unique. Partition each end before sorting so a
+        // full queue sorts only the entries this pass can actually serve.
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
-            }
+        let take = (max - again.len()).min(fresh.len());
+        if take == 0 {
+            return again;
         }
-        order.truncate(max);
-        order
+        let new_count = take.div_ceil(2);
+        let old_count = take / 2;
+        if new_count < fresh.len() {
+            fresh.select_nth_unstable_by(new_count, newest_first);
+        }
+        let (newest, rest) = fresh.split_at_mut(new_count);
+        newest.sort_unstable_by(newest_first);
+        let mut oldest = &mut rest[..0];
+        if old_count > 0 {
+            let oldest_at = rest.len() - old_count;
+            if oldest_at > 0 {
+                rest.select_nth_unstable_by(oldest_at, newest_first);
+            }
+            oldest = &mut rest[oldest_at..];
+            oldest.sort_unstable_by(|a, b| newest_first(b, a));
+        }
+        again.reserve(take);
+        for (position, &entry) in newest.iter().enumerate() {
+            again.push(entry);
+            again.extend(oldest.get(position).copied());
+        }
+        again
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -4649,5 +4670,49 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+
+    #[test]
+    fn bounded_texture_queue_due_matches_full_sort() {
+        let mut q = super::TextureQueue::default();
+        for i in 0..40u32 {
+            q.written(i, 1, 1, false);
+            if i % 5 == 0 {
+                let w = q.slots.get(&i).unwrap().write;
+                q.later(i, w, 0, 1);
+            }
+        }
+        // Reference: full sort matching original algorithm.
+        let reference = |max: usize| -> Vec<(u32, u64)> {
+            let mut again: Vec<(u32, u64)> = q
+                .slots
+                .iter()
+                .filter(|(_, w)| w.due <= 10 && (w.looks > 0 || w.mapped > 0))
+                .map(|(&i, w)| (i, w.write))
+                .collect();
+            let mut fresh: Vec<(u32, u64)> = q
+                .slots
+                .iter()
+                .filter(|(_, w)| w.due <= 10 && w.looks == 0 && w.mapped == 0)
+                .map(|(&i, w)| (i, w.write))
+                .collect();
+            again.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            fresh.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            let mut order = again;
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old && order.len() < max {
+                order.push(fresh[new]);
+                new += 1;
+                if new < old && order.len() < max {
+                    old -= 1;
+                    order.push(fresh[old]);
+                }
+            }
+            order.truncate(max);
+            order
+        };
+        for max in [0, 1, 4, 8, 9, 15, 20, 64] {
+            assert_eq!(q.due(10, max), reference(max), "mismatch for max={max}");
+        }
     }
 }

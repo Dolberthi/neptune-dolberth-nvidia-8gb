@@ -75,6 +75,11 @@ fn build() -> [u8; 32] {
     if let Some(exe) = exe {
         h.update(exe);
     }
+    if victory_shader::emit::early_depth() {
+        tracing::info!(
+            "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+        );
+    }
     h.update(&victory_shader::emit::translation_fingerprint());
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()

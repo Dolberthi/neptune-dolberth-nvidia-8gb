@@ -52,17 +52,12 @@ try {
     exit 1
 }
 
-# Scale worker pools cleanly across 4C/6C/8C+ CPUs (matches 5/6 on 6C/12T)
-$logical = [Environment]::ProcessorCount
-$thinThreads  = [Math]::Max(4, [Math]::Min(8, [int][Math]::Floor($logical / 2)))
-$turboThreads = [Math]::Max(3, [Math]::Min(6, $thinThreads - 1))
-
 $set = [ordered]@{
-    # 8 GB VRAM & 16 GB RAM profile (Neptune VRAM Guardian + ad3lre 8GB)
+    # 8 GB VRAM & 16 GB RAM profile (Neptune VRAM Guardian + 8 GB optimizations)
     VICTORY_CARD_WINDOWS_MB          = '512'
-    VICTORY_CARD_BUFFERS_MB          = '640'
+    VICTORY_CARD_BUFFERS_MB          = '1024'
     VICTORY_CARD_ROOM_FOR_TARGETS_MB = '512'
-    VICTORY_CARD_ROOM_FOR_BUFFERS    = '0'
+    VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
     VICTORY_TEXTURE_ROOM_PERCENT     = '92'
     VICTORY_TEXTURE_HEAPS            = '1'
     VICTORY_SLOT_EVICT               = '1'
@@ -71,6 +66,7 @@ $set = [ordered]@{
     VICTORY_VRAM_EVICT               = '92'
     VICTORY_VRAM_IDLE_MS             = '15000,4000,1500'
     VICTORY_TEXTURE_MAX_DIM          = $TextureMaxDim
+    VICTORY_CLAMP_WAITS              = '0'
     VICTORY_RAM_TRIM_MB              = '512'
     VICTORY_LIST_POOL_MB             = '384'
     VICTORY_LIST_POOL_MOST           = '768'
@@ -80,18 +76,18 @@ $set = [ordered]@{
     VICTORY_LEVELS_ON_DEMAND         = '1'
     VICTORY_DROP_DXIL                = '1'
 
-    # Neptune HyperEngine + Vertex + ad3lre CPU/GPU pipeline optimizations
+    # Neptune HyperEngine CPU/GPU pipeline optimizations (worker pools auto-scale by CPU cores inside victory.exe)
     VICTORY_PROCESS_PRIORITY         = 'normal'
-    VICTORY_TURBO_THREADS            = "$turboThreads"
     VICTORY_SHADER_META_CACHE        = '1'
     VICTORY_THIN                     = '1'
-    VICTORY_THIN_THREADS             = "$thinThreads"
     VICTORY_WATCH_4K                 = '1'
     VICTORY_GUARD_REST               = '3000'
     VICTORY_RANGED                   = '1'
     VICTORY_INDIRECT_RAW             = $(if ($RawIndirect) { '2' } else { '3' })
+    VICTORY_SWEEP_MS                 = '5000'
     VICTORY_INDIRECT_WINDOW          = '1'
     VICTORY_GROUPED_MESH_CLAMP       = '1'
+    VICTORY_CLAMP_OVER_DRAWS         = '1'
     VICTORY_SMART_COPY_BACK          = '1'
     VICTORY_SMART_COPY_BACK_KB       = '4'
     VICTORY_RELAY_OWN_QUEUE          = '1'
@@ -99,14 +95,14 @@ $set = [ordered]@{
     VICTORY_COPY_CHANGED             = '1'
     VICTORY_QUIET_BACK               = '1'
     VICTORY_UNDER_WRITES_WORDS       = '1'
-    VICTORY_UNDER_WRITES_RUNS        = '100000'
+    VICTORY_UNDER_WRITES_RUNS        = '4000000'
     VICTORY_UNDER_WRITES_MASKS       = '1'
     VICTORY_UNDER_WRITES_MASKS_LEAST = '1'
     VICTORY_WIDE_MERGE               = '1'
     VICTORY_WIDE_REFRESH             = '1'
-    VICTORY_WIDE_THREADS             = "$thinThreads"
+    VICTORY_WIDE_BACK                = '1'
     VICTORY_ASK_ONCE                 = '1'
-    VICTORY_ASK_QUIET                = '8'
+    VICTORY_ASK_QUIET                = '0'
     VICTORY_TEXTURE_NO_WAIT          = '1'
     VICTORY_TEXTURE_HASH_EVERY       = '32'
     VICTORY_CARD_REHASH_RUNS         = '1'
@@ -118,24 +114,25 @@ $set = [ordered]@{
     VICTORY_JOIN_COPIES              = '1'
     VICTORY_WINDOW_TAILS             = '1'
     VICTORY_WINDOW_KB                = '1024'
+    VICTORY_WINDOW_REUSE             = '1'
     VICTORY_CARD_BUFFERS_MIN_KB      = '64'
     VICTORY_CARD_WINDOW_UPLOAD       = '1'
     VICTORY_LATE_WAIT_LISTS          = '1024'
     VICTORY_D3D12_BACKGROUND         = '0'
     VICTORY_WAVE_OWN_LDS_GROUPS      = '64,128'
 
-    # Shader cache, streaming and stability
-    VICTORY_NAN_GUARD                = '0'
-    VICTORY_BAKE_TEXTURES_MS         = '2000'
-    VICTORY_EARLY_TEXTURES_MS        = '35'
+    # Shader cache, visual correctness, streaming and stability
+    VICTORY_NAN_GUARD                = '1'
+    VICTORY_EARLY_DEPTH              = '1'
+    VICTORY_BAKE_TEXTURES_MS         = '10000'
+    VICTORY_EARLY_TEXTURES_MS        = '40'
     VICTORY_TEXTURE_BATCH            = '1'
     VICTORY_HEAP_SYNC                = '1'
     VICTORY_DESC_DATA                = '1'
     VICTORY_OCEAN_READBACK           = '1'
     VICTORY_RT_RESOLVE               = '0'
     VICTORY_ACTIVATE_RAYS            = '0'
-    VICTORY_PIPELINE_WORKERS         = '3'
-    VICTORY_PIPELINE_WAIT_MS         = '2500'
+    VICTORY_PIPELINE_WAIT_MS         = '200'
     VICTORY_TITLE_WATCHDOG           = '0'
     VICTORY_TEARING                  = '1'
     VICTORY_DISCORD                  = '0'
@@ -167,9 +164,9 @@ if (-not $SkipWarm) {
     $stampFile = Join-Path $cacheDir '.warmed-neptune-stamp'
     $packItem = Get-Item -LiteralPath $shaderPack -ErrorAction SilentlyContinue
     $wantStamp = if ($packItem) {
-        "neptune-v2:$($packItem.Length):$($packItem.LastWriteTimeUtc.Ticks)"
+        "neptune-v3-nan-ez:$($packItem.Length):$($packItem.LastWriteTimeUtc.Ticks)"
     } else {
-        'neptune-v2:generic'
+        'neptune-v3-nan-ez:generic'
     }
     $hasStamp = (-not $WarmShaders) -and (Test-Path -LiteralPath $stampFile) -and `
         ((Get-Content -LiteralPath $stampFile -Raw -ErrorAction SilentlyContinue).Trim() -eq $wantStamp)

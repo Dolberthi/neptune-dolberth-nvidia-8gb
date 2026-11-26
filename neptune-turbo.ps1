@@ -16,7 +16,12 @@ param(
     [ValidateSet('Status', 'Preparar', 'Restaurar', 'Telemetria', 'PararTelemetria')]
     [string]$Acao = 'Status',
     [int]$JogoPid = 0,
-    [string[]]$Fechar = @('NVIDIA Broadcast', 'NVIDIA Broadcast UI'),
+    # 26/11: o NVIDIA Overlay segurava ~640 MB de VRAM (gravacao/Instant Replay); fechado, o nvcontainer o reabre
+    # em segundos com ~60 MB, e a gravacao (Alt+F9) continua funcionando.
+    [string[]]$Fechar = @('NVIDIA Broadcast', 'NVIDIA Broadcast UI', 'NVIDIA Overlay'),
+    # Servicos parados durante o jogo e religados no Restaurar (so os que estavam rodando). O Sunshine segurava
+    # ~810 MB de VRAM; num PC de 8 GB isso e textura jogada fora e placa esperando memoria.
+    [string[]]$PararServicos = @('SunshineService'),
     [switch]$NaoFechar,
     [switch]$NaoReabrir,
     [switch]$NaoRebaixar,
@@ -163,7 +168,7 @@ function Show-Status {
 function Invoke-Preparar {
     $sessao = (Get-Process -Id $PID).SessionId
     $estado = [ordered]@{ quando = (Get-Date).ToString('s'); ramAntes = Get-RamLivreMB; plano = $null
-        fechados = @(); reabrir = @(); processos = @(); dvr = @(); aparados = 0 }
+        fechados = @(); reabrir = @(); processos = @(); dvr = @(); aparados = 0; servicos = @() }
 
     if (-not $NaoEnergia) {
         $atual = Get-PlanoAtivo
@@ -189,6 +194,16 @@ function Invoke-Preparar {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         }
         if ($estado.fechados.Count -gt 0) { Write-Host ("Fechados durante o jogo: " + (($estado.fechados | Select-Object -Unique) -join ', ')) }
+        foreach ($nome in $PararServicos) {
+            $s = Get-Service -Name $nome -ErrorAction SilentlyContinue
+            if ($s -and $s.Status -eq 'Running') {
+                try {
+                    Stop-Service -Name $nome -Force -ErrorAction Stop
+                    $estado.servicos += $nome
+                } catch { Write-Host "Nao deu para parar o servico $nome (precisa de administrador)." }
+            }
+        }
+        if ($estado.servicos.Count -gt 0) { Write-Host ("Servicos parados durante o jogo: " + ($estado.servicos -join ', ')) }
     }
 
     if (-not $NaoGameDvr) {
@@ -250,6 +265,10 @@ function Invoke-Restaurar {
     }
     Write-Host "Prioridades restauradas: $voltaram programas."
     foreach ($d in @($estado.dvr)) { if ($d) { Set-ItemProperty -Path $d.chave -Name $d.nome -Value $d.valor -ErrorAction SilentlyContinue } }
+    foreach ($nome in @($estado.servicos)) {
+        if (-not $nome) { continue }
+        try { Start-Service -Name $nome -ErrorAction Stop; Write-Host "Servico religado: $nome" } catch { Write-Host "Nao deu para religar o servico $nome." }
+    }
     if (-not $NaoReabrir) {
         foreach ($c in @($estado.reabrir)) {
             if (-not $c -or -not (Test-Path -LiteralPath $c)) { continue }

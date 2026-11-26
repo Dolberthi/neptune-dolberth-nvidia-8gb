@@ -577,7 +577,11 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    // Periodic saves hold `library.saving.write()` (blocking `StorePipeline`
+    // across all workers) while serialising hundreds of MB to disk; 60 s cuts
+    // write amplification and worker stalls 3x, while `drained()` and exit
+    // still flush immediately with `now = true`.
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());

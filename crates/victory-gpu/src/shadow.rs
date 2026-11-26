@@ -107,6 +107,9 @@ struct Card {
     chunks: Mutex<Vec<(usize, usize, crate::windowup::Chunk)>>,
     /// (Neptune) Whether `dirty` took a range since [`card_dirty`] last looked.
     flagged: std::sync::atomic::AtomicBool,
+    /// (Neptune) The copy itself, for [`Card::mark`] to queue it in [`CARD_FLAGGED`]:
+    /// set once the copy is shared.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -242,6 +245,47 @@ pub(crate) fn card_room_kept() -> u64 {
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// (Neptune) The copies in the card's memory flagged since [`card_dirty`] last
+/// looked ([`Card::mark`]), each once. Before, `card_dirty` walked every copy in
+/// [`CARDED`] at each of the ~37 submissions of a frame (thousands of copies,
+/// each an upgrade and a flag read on a different line of memory, much of it
+/// paged out on a 16 GB PC): 2.6 s of the submitting thread's wall time in 29 s
+/// of play (2026-11-26, profile 3), for the few copies that had changed.
+/// A leaf lock: nothing else is taken while it is held.
+static CARD_FLAGGED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// (Neptune) `VICTORY_CARD_DIRTY_WALK=1`: [`card_dirty`] walks every copy, as before.
+fn card_dirty_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DIRTY_WALK").is_some_and(|v| v == "1"))
+}
+
+impl Card {
+    /// (Neptune) Something for [`card_dirty`] to take: the flag, and the copy in
+    /// [`CARD_FLAGGED`] the first time it is set.
+    fn mark(&self) {
+        if !self.flagged.swap(true, Ordering::AcqRel)
+            && let Some(me) = self.me.get()
+        {
+            CARD_FLAGGED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
+    }
+}
+
+/// (Neptune) A copy in the card's memory is shared: [`CARDED`] counts it, and
+/// [`CARD_FLAGGED`] has it, for a new copy starts flagged.
+fn carded(shadow: &Arc<Shadow>) {
+    let Some(card) = &shadow.card else {
+        return;
+    };
+    let weak = Arc::downgrade(shadow);
+    let _ = card.me.set(weak.clone());
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
+    if card.flagged.load(Ordering::Acquire) {
+        CARD_FLAGGED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    }
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -493,23 +537,15 @@ fn window_rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>)>, Vec<Uploads>) {
     let mut out = Vec::new();
     let mut uploads: Vec<Uploads> = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        // (Neptune) Nothing changed since it was last asked, as for nearly all of the
-        // thousands of them at any one submission: no lock taken.
-        if shadow.card.as_ref().is_some_and(|c| !c.flagged.swap(false, Ordering::AcqRel)) {
-            return true;
-        }
+    // What one flagged copy gives: its chunks (a transient window) or its dirty ranges.
+    let mut take = |shadow: Arc<Shadow>| {
         if shadow.transient() {
             let taken = shadow.card.as_ref().map(|c| std::mem::take(&mut *c.chunks.lock().unwrap_or_else(|e| e.into_inner())));
             if let Some(taken) = taken.filter(|t| !t.is_empty()) {
                 uploads.push((shadow, taken));
             }
-            return true;
+            return;
         }
         let ranges = shadow
             .card
@@ -528,8 +564,40 @@ pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>
         if !ranges.is_empty() {
             out.push((shadow, joined(ranges)));
         }
-        true
-    });
+    };
+    if card_dirty_walk() {
+        // As before: every copy, the flag of each read.
+        CARD_FLAGGED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded.retain(|weak| {
+            let Some(shadow) = weak.upgrade() else {
+                return false;
+            };
+            if shadow.card.as_ref().is_some_and(|c| !c.flagged.swap(false, Ordering::AcqRel)) {
+                return true;
+            }
+            take(shadow);
+            true
+        });
+        return (out, uploads);
+    }
+    // (Neptune) Only the copies flagged since the last call. The queue's lock is let go
+    // before any copy's own locks are taken.
+    let flagged = std::mem::take(&mut *CARD_FLAGGED.lock().unwrap_or_else(|e| e.into_inner()));
+    for weak in flagged {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        if shadow.card.as_ref().is_some_and(|c| !c.flagged.swap(false, Ordering::AcqRel)) {
+            continue;
+        }
+        take(shadow);
+    }
+    // [`CARDED`] now only counts: copies gone are taken out now and then.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(512) {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.strong_count() > 0);
+    }
     (out, uploads)
 }
 
@@ -1506,7 +1574,7 @@ fn workers() -> &'static Workers {
         let n = std::env::var("VICTORY_WIDE_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6), |n| n.clamp(2, 24));
+            .map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 3).clamp(2, 6), |n| n.clamp(2, 24));
         let n = if which == 1 { (n / 2).max(2) } else { n };
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{which}-{i}")).spawn(move || {
@@ -2482,8 +2550,9 @@ pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
         let loose = loose_write();
         loose
-            .values()
-            .map(|s| {
+            .iter()
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(_, s)| {
                 let low = s.asked[0].load(Ordering::Relaxed);
                 let high = s.asked[1].load(Ordering::Relaxed);
                 high.saturating_sub(low)
@@ -2505,7 +2574,14 @@ pub(crate) fn windows() -> [u64; 3] {
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
     let loose = loose_write();
+    let mut refs_in_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for s in loose.values() {
+        *refs_in_map.entry(Arc::as_ptr(s) as usize).or_insert(0) += 1;
+    }
+    for (&(ks, kl), s) in loose.iter() {
+        if ks != s.start || kl != s.len {
+            continue;
+        }
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
@@ -2513,7 +2589,8 @@ pub(crate) fn window_use() -> [u64; 8] {
             out[1] += 1;
             out[2] += s.len;
         }
-        if Arc::strong_count(s) > 1 {
+        let in_map = refs_in_map.get(&(Arc::as_ptr(s) as usize)).copied().unwrap_or(1);
+        if Arc::strong_count(s) > in_map {
             out[3] += 1;
             out[4] += s.len;
         }
@@ -2524,6 +2601,17 @@ pub(crate) fn window_use() -> [u64; 8] {
     }
     out[7] = window();
     out
+}
+
+/// Groups every key in `map` by the identity of the `Arc<T>` it holds:
+/// needed when a single copy stands under several keys (canonical +
+/// aliases, [`window_reuse`]).
+fn group_by_ptr<T>(map: &BTreeMap<(u64, u64), Arc<T>>) -> std::collections::HashMap<usize, Vec<(u64, u64)>> {
+    let mut groups: std::collections::HashMap<usize, Vec<(u64, u64)>> = std::collections::HashMap::new();
+    for (&key, val) in map {
+        groups.entry(Arc::as_ptr(val) as usize).or_default().push(key);
+    }
+    groups
 }
 
 /// Lets go of the copies of windows outside buffers that nothing names any
@@ -2561,16 +2649,31 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
+        let groups = group_by_ptr(&map);
+        let idle = |s: &Arc<Shadow>, in_map: usize| {
+            Arc::strong_count(s) == in_map
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                && crate::host::references(&s.buffer) == 1
+        };
+        let candidates: Vec<Vec<(u64, u64)>> = groups
+            .into_values()
+            .filter(|keys| map.get(&keys[0]).is_some_and(|s| idle(s, keys.len())))
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let mut gone = Vec::new();
+        for keys in candidates {
+            if map.get(&keys[0]).is_some_and(|s| idle(s, keys.len())) {
+                let mut removed = None;
+                for key in keys {
+                    if let Some(s) = map.remove(&key) {
+                        removed.get_or_insert(s);
+                    }
+                }
+                if let Some(s) = removed {
+                    gone.push(s);
+                }
+            }
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3762,7 +3865,7 @@ impl Shadow {
         chunks.retain(|c| !(a <= c.0 && c.1 <= b));
         chunks.push((a, b, chunk));
         drop(chunks);
-        card.flagged.store(true, Ordering::Release);
+        card.mark();
         n
     }
 
@@ -3787,7 +3890,7 @@ impl Shadow {
             _ => dirty.push((from, to)),
         }
         drop(dirty);
-        card.flagged.store(true, Ordering::Release);
+        card.mark();
     }
 
     /// (Neptune) [`Shadow::card_changed`] for `runs` (offset, bytes; in
@@ -3805,7 +3908,7 @@ impl Shadow {
             }
         }
         drop(dirty);
-        card.flagged.store(true, Ordering::Release);
+        card.mark();
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -4206,12 +4309,28 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = loose_write();
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
-            .map(|(key, _)| *key)
+        let max_len = MAX_LOOSE_LEN.load(Ordering::Relaxed);
+        let hit_ptrs: std::collections::HashSet<usize> = map
+            .range((at.saturating_sub(max_len), 0)..(end, 0))
+            .filter(|(_, shadow)| shadow.place.is_some() && shadow.start < end && shadow.start + shadow.len > at)
+            .map(|(_, shadow)| Arc::as_ptr(shadow) as usize)
             .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        let keys: Vec<(u64, u64)> = if hit_ptrs.is_empty() {
+            Vec::new()
+        } else {
+            map.iter()
+                .filter(|(_, shadow)| hit_ptrs.contains(&(Arc::as_ptr(shadow) as usize)))
+                .map(|(key, _)| *key)
+                .collect()
+        };
+        let mut seen = std::collections::HashSet::new();
+        for key in keys {
+            if let Some(shadow) = map.remove(&key)
+                && seen.insert(Arc::as_ptr(&shadow) as usize)
+            {
+                gone.push(shadow);
+            }
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
@@ -4235,7 +4354,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = loose_write();
-    spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
+    spans.extend(
+        loose
+            .iter()
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(&(start, len), _)| (start, len, true)),
+    );
     spans
 }
 
@@ -4364,6 +4488,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     staging: Some(buffer),
                     chunks: Mutex::default(),
                     flagged: std::sync::atomic::AtomicBool::new(true),
+                    me: std::sync::OnceLock::new(),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -4391,9 +4516,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
+        carded(&shadow);
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
@@ -4507,6 +4630,89 @@ fn fine() -> bool {
     tails() || window() < WINDOW
 }
 
+/// Whether a sized ask for loose title memory (`find`) reuses an existing
+/// containing window by aliasing its grid key to that window instead of
+/// allocating a duplicate host buffer, and immediately reclaims unused
+/// smaller windows strictly superseded by a newly allocated larger window
+/// (`VICTORY_WINDOW_REUSE`; on by default, set `=0` to disable; MKmajster 6aeb3733).
+fn window_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_REUSE").is_none_or(|v| v != "0"))
+}
+
+/// Largest loose window length allocated so far, so range searches for a
+/// containing window also find windows larger than `WINDOW`.
+static MAX_LOOSE_LEN: AtomicU64 = AtomicU64::new(WINDOW);
+
+/// Since the start (`VICTORY_WINDOW_REUSE=1`): duplicate windows avoided via
+/// key aliasing, their bytes, unused superseded windows reclaimed right away,
+/// and their bytes.
+static WINDOW_REUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Of `windows` (start, bytes), those strictly contained inside `[start,
+/// start + len)` (excluding `(start, len)` itself).
+fn strictly_inside(windows: impl Iterator<Item = (u64, u64)>, start: u64, len: u64) -> Vec<(u64, u64)> {
+    let end = start.saturating_add(len);
+    windows
+        .filter(|&(ks, kl)| ks >= start && ks.saturating_add(kl) <= end && (ks, kl) != (start, len))
+        .collect()
+}
+
+/// Reclaims any canonical windows in `map` strictly inside `[start, start +
+/// len)` that are held by `map` alone (no list, no heap pass, no descriptor
+/// slot).
+fn reclaim_superseded(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, start: u64, len: u64) -> Vec<Arc<Shadow>> {
+    let end = start.saturating_add(len);
+    let inner_canonical = strictly_inside(
+        map.range((start, 0)..(end, 0))
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(&k, _)| k),
+        start,
+        len,
+    );
+    if inner_canonical.is_empty() {
+        return Vec::new();
+    }
+    let inner_ptrs: std::collections::HashSet<usize> = inner_canonical
+        .iter()
+        .filter_map(|k| map.get(k).map(|s| Arc::as_ptr(s) as usize))
+        .collect();
+    let mut by_ptr: std::collections::HashMap<usize, Vec<(u64, u64)>> = std::collections::HashMap::new();
+    for (&k, s) in map.range((start, 0)..(end, 0)) {
+        let ptr = Arc::as_ptr(s) as usize;
+        if inner_ptrs.contains(&ptr) {
+            by_ptr.entry(ptr).or_default().push(k);
+        }
+    }
+    let unused = |s: &Arc<Shadow>, in_map: usize| {
+        Arc::strong_count(s) == in_map && crate::host::references(&s.buffer) == 1
+    };
+    let candidates: Vec<Vec<(u64, u64)>> = by_ptr
+        .into_values()
+        .filter(|keys| map.get(&keys[0]).is_some_and(|s| unused(s, keys.len())))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut gone = Vec::new();
+    for keys in candidates {
+        if map.get(&keys[0]).is_some_and(|s| unused(s, keys.len())) {
+            let mut removed = None;
+            for key in keys {
+                if let Some(s) = map.remove(&key) {
+                    removed.get_or_insert(s);
+                }
+            }
+            if let Some(s) = removed {
+                WINDOW_REUSED[2].fetch_add(1, Ordering::Relaxed);
+                WINDOW_REUSED[3].fetch_add(s.len, Ordering::Relaxed);
+                gone.push(s);
+            }
+        }
+    }
+    gone
+}
+
 /// For the memory line: the bytes of title memory the windows alive lie
 /// over (each byte once), beside the windows' own bytes in
 /// [`memory`]: the difference is memory that is in more than one window,
@@ -4514,7 +4720,12 @@ fn fine() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
     let loose = loose_write();
-    cover(loose.keys().copied())
+    cover(
+        loose
+            .iter()
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(&k, _)| k),
+    )
 }
 
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
@@ -4546,7 +4757,19 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+fn canonical_in(
+    map: &BTreeMap<(u64, u64), Arc<Shadow>>,
+    from: u64,
+    to: u64,
+) -> impl Iterator<Item = (u64, u64)> + '_ {
+    map.range((from, 0)..=(to, u64::MAX))
+        .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+        .map(|(&k, _)| k)
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    let reuse = window_reuse();
+    let max_len = MAX_LOOSE_LEN.load(Ordering::Relaxed);
     {
         // (Neptune) The window is there already, the usual case: found and noted used beside
         // the other readers (what lets windows go takes the lock alone).
@@ -4554,11 +4777,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let (cell, _) = window_of(address, end, WINDOW);
         let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
         let (start, len) = if unsized_ask && tails() {
-            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+            longest_tail(canonical_in(&map, cell, address), address, end).unwrap_or_else(|| tail_of(address, end))
         } else if any && fine() && !unsized_ask {
-            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-            holder(there, address, end).unwrap_or(named)
+            let from = if reuse { address.saturating_sub(max_len) } else { cell };
+            holder(canonical_in(&map, from, address), address, end).unwrap_or(named)
         } else {
             named
         };
@@ -4575,18 +4797,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut map = loose_write();
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
@@ -4596,16 +4806,61 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    let max_len = MAX_LOOSE_LEN.load(Ordering::Relaxed);
+    let (start, len) = if unsized_ask && tails() {
+        longest_tail(canonical_in(&map, cell, address), address, end).unwrap_or_else(|| tail_of(address, end))
+    } else if any && fine() && !unsized_ask {
+        // The windows that begin in the ask's cell at or below the ask (or,
+        // with `VICTORY_WINDOW_REUSE=1`, any larger window reaching across
+        // the cell line).
+        let from = if reuse { address.saturating_sub(max_len) } else { cell };
+        holder(canonical_in(&map, from, address), address, end).unwrap_or(named)
+    } else if !unsized_ask && reuse {
+        if let Some(shadow) = map.get(&named) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        let from = named.0.saturating_sub(max_len);
+        if let Some(existing) = holder(canonical_in(&map, from, named.0), named.0, named.0 + named.1)
+            && let Some(shadow) = map.get(&existing).cloned()
+        {
+            note(&shadow);
+            map.insert(named, shadow.clone());
+            let n = WINDOW_REUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let saved = WINDOW_REUSED[1].fetch_add(named.1, Ordering::Relaxed) + named.1;
+            if n == 1 || n.is_multiple_of(64) {
+                tracing::info!(
+                    "loose windows reused via alias (VICTORY_WINDOW_REUSE=1): {n} duplicate buffers avoided ({} MB saved), {} superseded windows reclaimed ({} MB)",
+                    saved >> 20,
+                    WINDOW_REUSED[2].load(Ordering::Relaxed),
+                    WINDOW_REUSED[3].load(Ordering::Relaxed) >> 20,
+                );
+            }
+            return Some(shadow);
+        }
+        named
+    } else {
+        named
+    };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
     }
+    let insert_and_reclaim = |map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, shadow: Arc<Shadow>| -> (Arc<Shadow>, Vec<Arc<Shadow>>) {
+        note(&shadow);
+        MAX_LOOSE_LEN.fetch_max(len, Ordering::Relaxed);
+        map.insert((start, len), shadow.clone());
+        let retired = if reuse { reclaim_superseded(map, start, len) } else { Vec::new() };
+        (shadow, retired)
+    };
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
+        let (shadow, retired) = insert_and_reclaim(&mut map, Arc::new(Shadow::placed(placed, start, len, true)));
+        drop(map);
+        for old in retired {
+            crate::host::retire(old);
+        }
         return Some(shadow);
     }
     // (Neptune) With `window_upload`, a window that gets a card side has no CPU side
@@ -4623,6 +4878,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             staging: None,
             chunks: Mutex::default(),
             flagged: std::sync::atomic::AtomicBool::new(true),
+            me: std::sync::OnceLock::new(),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -4641,6 +4897,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                     staging: Some(buffer),
                     chunks: Mutex::default(),
                     flagged: std::sync::atomic::AtomicBool::new(true),
+                    me: std::sync::OnceLock::new(),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -4674,11 +4931,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         TRANSIENT[0].fetch_add(1, Ordering::Relaxed);
     }
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    carded(&shadow);
+    let (shadow, retired) = insert_and_reclaim(&mut map, shadow);
+    drop(map);
+    for old in retired {
+        crate::host::retire(old);
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
     Some(shadow)
 }
 
@@ -4935,6 +5193,7 @@ mod card_merge_tests {
                 staging: Some(staging.clone()),
                 chunks: Mutex::default(),
                 flagged: std::sync::atomic::AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),

@@ -474,7 +474,9 @@ const MAKING: u8 = 3;
 fn worker_count() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
-        let default_workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // Half the logical threads (capped at 6 to avoid driver-compiler RAM
+        // spikes on 16 GB PCs); workers already run at `BELOW_NORMAL`.
+        let default_workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 6));
         std::env::var("VICTORY_PIPELINE_WORKERS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())

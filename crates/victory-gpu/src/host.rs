@@ -335,7 +335,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        drop_aside(vec![Retired(Box::new(object))]);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -357,7 +357,46 @@ fn bury(finished: u64) {
         if !keep.is_empty() {
             list.lock().unwrap_or_else(|e| e.into_inner()).extend(keep);
         }
-        drop(done);
+        drop_aside(done.into_iter().map(|(_, retired)| retired).collect());
+    }
+}
+
+/// (Neptune) Drops `items` on a thread of its own ("victory-drop"), not on the
+/// thread that let them go. A host texture or buffer let go is a call into the
+/// driver and the kernel (the allocation is destroyed): in profile 3
+/// (2026-11-26) the submitting thread stood in such calls under
+/// `resource::let_go_idle` and `sweep` for some 10 ms a frame, while the card
+/// waited for its next submission. What is dropped here already waited for
+/// every submission that could use it ([`retire`], [`bury`]); D3D12 objects
+/// are free-threaded, and nothing waits for this thread, so no lock order
+/// changes. `VICTORY_DROP_ASIDE=0`: dropped where they were let go, as before.
+fn drop_aside(items: Vec<Retired>) {
+    if items.is_empty() {
+        return;
+    }
+    static TX: OnceLock<Option<std::sync::mpsc::Sender<Vec<Retired>>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        if std::env::var_os("VICTORY_DROP_ASIDE").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<Retired>>();
+        std::thread::Builder::new()
+            .name("victory-drop".into())
+            .spawn(move || {
+                for batch in rx {
+                    drop(batch);
+                }
+            })
+            .ok()?;
+        Some(tx)
+    });
+    match tx {
+        Some(tx) => {
+            if let Err(back) = tx.send(items) {
+                drop(back.0);
+            }
+        }
+        None => drop(items),
     }
 }
 
@@ -6659,7 +6698,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch::reused();
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -6667,24 +6706,26 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            // (Neptune) FxHash: one entry per copy the submission refreshes (the list ahead of
-            // a frame alone refreshes some 4,100), keyed by the copy's address. `ask_once`
-            // sorts what it is given, so the order the map hands them out in is no matter.
-            let mut spans: crate::turbo::FastMap<usize, (usize, usize)> = crate::turbo::FastMap::default();
+            // (Neptune) FxHash, reused across submissions via `Batch`: one entry per copy
+            // the submission refreshes, keyed by the copy's address. `ask_once` sorts what
+            // it is given, so the order the map hands them out in is no matter.
+            batch.ask_spans.clear();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
                     {
-                        let span = spans
+                        let span = batch
+                            .ask_spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
                         *span = (span.0.min(*address), span.1.max(*address + *len));
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
+            batch.ask_ranges.clear();
+            batch.ask_ranges.extend(batch.ask_spans.values().copied());
+            crate::watch::ask_once(&batch.ask_ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -6693,7 +6734,7 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
+                crate::watch::ask_once(&batch.ask_ranges);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
@@ -6769,6 +6810,7 @@ impl Host {
                 back,
                 writes,
             };
+            batch.give_back();
             working(was_working);
             return Some((submitted, sent));
         }
@@ -6919,6 +6961,7 @@ impl Host {
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         }
+        batch.give_back();
         working(was_working);
         None
     }
@@ -8278,9 +8321,33 @@ struct Batch {
     index: crate::turbo::FastMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: crate::turbo::FastSet<usize>,
+    /// Per-submission write-watch asking scratch (`VICTORY_ASK_ONCE`), kept
+    /// across submissions to avoid 28+ table growths and allocations a frame.
+    ask_spans: crate::turbo::FastMap<usize, (usize, usize)>,
+    ask_ranges: Vec<(usize, usize)>,
+}
+
+thread_local! {
+    /// The last submission's [`Batch`] on this thread, emptied with its room
+    /// kept for the next submission (foxhound 19720fee).
+    static SPARE_BATCH: std::cell::Cell<Option<Batch>> = const { std::cell::Cell::new(None) };
 }
 
 impl Batch {
+    /// This thread's last [`Batch`], emptied, or a new one.
+    fn reused() -> Batch {
+        SPARE_BATCH.take().unwrap_or_default()
+    }
+
+    /// Emptied (capacity kept) for this thread's next submission.
+    fn give_back(mut self) {
+        self.refreshes.clear();
+        self.index.clear();
+        self.textures.clear();
+        self.ask_spans.clear();
+        self.ask_ranges.clear();
+        SPARE_BATCH.set(Some(self));
+    }
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Checked already in this submission (`crate::stamp`): nothing to merge.
         if shadow.current(address, len) {

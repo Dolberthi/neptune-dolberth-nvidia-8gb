@@ -22,9 +22,15 @@
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
+    let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
+        return;
+    };
     for (rect, out) in src
-        .chunks_exact(3 * stride)
-        .zip(dst.chunks_exact_mut(6 * stride))
+        .chunks_exact(in_rect)
+        .zip(dst.chunks_exact_mut(out_rect))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
@@ -55,6 +61,18 @@ enum Kind {
     F16,
     Unorm8,
     Unorm16,
+    Snorm8,
+    Snorm16,
+}
+
+/// (Neptune, from VIctory Equinox 0.1.0-equinox.1 "normalized rectangle attributes", GPL-3.0)
+/// Rectangles whose vertices carry 8/16-bit UNORM/SNORM attributes are expanded too; before,
+/// a rectangle with such an attribute was not drawn (`State::draw` leaves out what
+/// `expand_rects` cannot complete): whole quads could go missing. `VICTORY_RECT_NORMALIZED=0`:
+/// as before.
+fn extended_rects() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_RECT_NORMALIZED").is_none_or(|v| v != "0"))
 }
 
 /// Component count and kind of the vertex formats rectangles use.
@@ -69,7 +87,16 @@ fn components(format: u32) -> Option<(usize, Kind)> {
         54 => (1, Kind::F16),
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
+        56 if extended_rects() => (1, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        49 if extended_rects() => (2, Kind::Unorm8),
+        61 if extended_rects() => (1, Kind::Unorm8),
+        13 if extended_rects() => (4, Kind::Snorm16),
+        37 if extended_rects() => (2, Kind::Snorm16),
+        58 if extended_rects() => (1, Kind::Snorm16),
+        31 if extended_rects() => (4, Kind::Snorm8),
+        51 if extended_rects() => (2, Kind::Snorm8),
+        63 if extended_rects() => (1, Kind::Snorm8),
         _ => return None,
     })
 }
@@ -78,8 +105,8 @@ impl Kind {
     fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
-            Kind::F16 | Kind::Unorm16 => 2,
-            Kind::Unorm8 => 1,
+            Kind::F16 | Kind::Unorm16 | Kind::Snorm16 => 2,
+            Kind::Unorm8 | Kind::Snorm8 => 1,
         }
     }
 
@@ -90,6 +117,8 @@ impl Kind {
             Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
             Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
             Kind::Unorm8 => f32::from(b[0]) / 255.0,
+            Kind::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
+            Kind::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
         }
     }
 
@@ -103,6 +132,10 @@ impl Kind {
                 b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
             }
             Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Kind::Snorm16 => {
+                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
+            }
+            Kind::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
         }
     }
 }
@@ -233,5 +266,40 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+    #[test]
+    fn normalized_attributes_are_interpolated_in_their_own_range() {
+        let vertex = |rg: [u8; 2], u16_value: u16, u8_value: u8, snorm8: i8, snorm16: i16| {
+            [
+                &rg[..],
+                &u16_value.to_le_bytes(),
+                &[u8_value, snorm8 as u8],
+                &snorm16.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let src = [
+            vertex([3, 250], 1000, 10, i8::MIN, -23000),
+            vertex([8, 200], 500, 3, -120, -18000),
+            vertex([20, 253], 10000, 100, -120, -32000),
+        ]
+        .concat();
+        let mut dst = [0; 6 * 8];
+        expand_rects(
+            &src,
+            &mut dst,
+            8,
+            &[(0, 49), (2, 56), (4, 61), (5, 63), (6, 58)],
+        );
+        assert_eq!(dst[40..], vertex([15, 255], 10500, 107, -127, -32767));
+    }
+
+    #[test]
+    fn zero_or_overflowing_stride_is_ignored_without_panicking() {
+        let mut dst = [0xAAu8; 16];
+        expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+        expand_rects(&[1, 2, 3], &mut dst, usize::MAX / 2, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
     }
 }
