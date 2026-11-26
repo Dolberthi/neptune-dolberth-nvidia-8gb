@@ -10065,10 +10065,10 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
         .name("victory-window".into())
         .spawn(move || {
             let made = make_window(width, height);
-            let ok = made.is_ok();
+            let hwnd = made.as_ref().ok().copied();
             let _ = sender.send(made.map(|h| h.0 as usize));
-            if ok {
-                pump();
+            if let Some(hwnd) = hwnd {
+                pump(hwnd);
             }
         })
         .map_err(|_| windows::core::Error::empty())?;
@@ -10092,7 +10092,7 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
 
     let raw = hwnd.0 as SysHwnd;
     let style = unsafe { wm::GetWindowLongPtrW(raw, wm::GWL_STYLE) } as u32;
-    let is_fullscreen = (style & wm::WS_OVERLAPPEDWINDOW) == 0;
+    let is_fullscreen = (style & wm::WS_CAPTION) != wm::WS_CAPTION;
     let (sw, sh) = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
 
     if is_fullscreen {
@@ -10114,9 +10114,10 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         unsafe {
             wm::SetWindowLongPtrW(raw, wm::GWL_STYLE, (wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE) as isize);
             wm::SetWindowLongPtrW(raw, wm::GWL_EXSTYLE, 0);
+            wm::ShowWindow(raw, wm::SW_RESTORE);
             wm::SetWindowPos(
                 raw,
-                wm::HWND_TOP,
+                wm::HWND_NOTOPMOST,
                 r.left,
                 r.top,
                 r.right - r.left,
@@ -10124,6 +10125,13 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
                 wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
             );
         }
+        tracing::info!(
+            x = r.left,
+            y = r.top,
+            w = r.right - r.left,
+            h = r.bottom - r.top,
+            "window: switched to windowed mode (F11)"
+        );
     } else {
         let mut cur = SysRect { left: 0, top: 0, right: 0, bottom: 0 };
         if unsafe { wm::GetWindowRect(raw, &mut cur) } != 0 {
@@ -10143,6 +10151,7 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
                     wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
                 );
             }
+            tracing::info!(w = sw, h = sh, "window: switched to borderless fullscreen (F11)");
         }
     }
 }
@@ -10153,19 +10162,6 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    const WM_KEYDOWN_MSG: u32 = 0x0100;
-    const WM_SYSKEYDOWN_MSG: u32 = 0x0104;
-    const VK_F11: usize = 0x7A;
-    const VK_RETURN: usize = 0x0D;
-    let fresh_press = (lparam.0 & (1 << 30)) == 0;
-    if fresh_press
-        && ((message == WM_KEYDOWN_MSG && wparam.0 == VK_F11)
-            || (message == WM_SYSKEYDOWN_MSG && wparam.0 == VK_RETURN))
-    {
-        // SAFETY: runs on the thread that owns `hwnd`.
-        unsafe { toggle_fullscreen(hwnd) };
-        return LRESULT(0);
-    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -10231,11 +10227,38 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     }
 }
 
-fn pump() {
+fn pump(hwnd: HWND) {
+    use windows_sys::Win32::Foundation::HWND as SysHwnd;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+
+    const TIMER_F11: usize = 0xF11;
+    const VK_F11: i32 = 0x7A;
+    const VK_MENU: i32 = 0x12;
+    const VK_RETURN: i32 = 0x0D;
+
+    let raw = hwnd.0 as SysHwnd;
+    let mut was_toggle = false;
     let mut message = MSG::default();
-    // SAFETY: the standard message loop of this thread's window.
+    // SAFETY: timer and message loop run on the thread that owns `hwnd`.
     unsafe {
+        wm::SetTimer(raw, TIMER_F11, 40, None);
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            if message.message == wm::WM_TIMER && message.wParam.0 == TIMER_F11 {
+                let mut pid = 0u32;
+                let front = wm::GetForegroundWindow();
+                wm::GetWindowThreadProcessId(front, &mut pid);
+                let in_front = !front.is_null() && pid == GetCurrentProcessId();
+                let f11 = GetAsyncKeyState(VK_F11) < 0;
+                let alt_enter = GetAsyncKeyState(VK_MENU) < 0 && GetAsyncKeyState(VK_RETURN) < 0;
+                let pressed = f11 || alt_enter;
+                if in_front && pressed && !was_toggle {
+                    toggle_fullscreen(hwnd);
+                }
+                was_toggle = pressed;
+                continue;
+            }
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
