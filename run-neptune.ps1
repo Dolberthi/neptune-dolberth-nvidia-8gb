@@ -57,9 +57,9 @@ $set = [ordered]@{
     # 8 GB VRAM & 16 GB RAM profile (Neptune VRAM Guardian + ad3lre 8GB)
     VICTORY_CARD_WINDOWS_MB          = '512'
     VICTORY_CARD_BUFFERS_MB          = '640'
-    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '768'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '512'
     VICTORY_CARD_ROOM_FOR_BUFFERS    = '0'
-    VICTORY_TEXTURE_ROOM_PERCENT     = '88'
+    VICTORY_TEXTURE_ROOM_PERCENT     = '92'
     VICTORY_TEXTURE_HEAPS            = '1'
     VICTORY_SLOT_EVICT               = '1'
     VICTORY_SLOT_EVICT_PERCENT       = '90'
@@ -71,8 +71,8 @@ $set = [ordered]@{
     VICTORY_LIST_POOL_MB             = '384'
     VICTORY_LIST_POOL_MOST           = '768'
     VICTORY_LIST_POOL_IDLE_S         = '10'
-    VICTORY_TEXTURE_STAGE_MB         = '192'
-    VICTORY_DSTORAGE_STAGING_MB      = '32'
+    VICTORY_TEXTURE_STAGE_MB         = '256'
+    VICTORY_DSTORAGE_STAGING_MB      = '64'
     VICTORY_LEVELS_ON_DEMAND         = '1'
     VICTORY_DROP_DXIL                = '1'
 
@@ -122,8 +122,8 @@ $set = [ordered]@{
 
     # Shader cache, streaming and stability
     VICTORY_NAN_GUARD                = '0'
-    VICTORY_BAKE_TEXTURES_MS         = '1500'
-    VICTORY_EARLY_TEXTURES_MS        = '20'
+    VICTORY_BAKE_TEXTURES_MS         = '2000'
+    VICTORY_EARLY_TEXTURES_MS        = '35'
     VICTORY_TEXTURE_BATCH            = '1'
     VICTORY_HEAP_SYNC                = '1'
     VICTORY_DESC_DATA                = '1'
