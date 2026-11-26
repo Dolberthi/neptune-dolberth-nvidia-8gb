@@ -53,11 +53,27 @@ This fork unifies community CPU/VRAM/NVIDIA improvements from **Neptune-VE**, **
 
 ## ◆ Requirements
 
-- **OS:** Windows 11 or Windows 10 (22H2 / 19045+ with `D3D12\D3D12Core.dll` from DirectX 12 Agility SDK `1.620.2`)
-- **GPU:** DirectX 12 Ultimate GPU with 8 GB+ VRAM (tested on NVIDIA RTX 4060 8 GB)
-- **CPU:** 6+ cores recommended (AMD Ryzen Zen 2+ executes Xbox Zen 2 instructions natively; tested on Ryzen 5 5500 6C/12T)
-- **RAM:** 16 GB+
-- **Toolchain:** [rustup](https://rustup.rs) (nightly toolchain via `rust-toolchain.toml`) + Visual Studio Build Tools (MSVC + Windows SDK)
+Check every line before reporting a crash: most startup failures come from one of these.
+
+| | Needed | Notes |
+|---|---|---|
+| **OS** | Windows 10 22H2 (19045+) or Windows 11, x64 | Keep Windows Update current. |
+| **GPU** | DirectX 12 Ultimate: Shader Model 6.6 + mesh shaders, **8 GB+ VRAM** | NVIDIA RTX 20 series or newer (tested: RTX 4060 8 GB). Current driver. Resizable BAR on in the BIOS helps. |
+| **D3D12 Agility SDK** | `D3D12\D3D12Core.dll` **1.620.2 (x64)** beside `victory.exe` | **Included** (`redist/D3D12`) and copied by `cargo build` to `target\release\D3D12\`. Needed on Windows 10 *and* 11. Missing or another version → `0x887E0003`. See [Troubleshooting](#-troubleshooting). |
+| **CPU** | x64 with **AVX2**, 6+ cores recommended | Tested: Ryzen 5 5500 (6C/12T). |
+| **RAM** | 16 GB minimum, **32 GB recommended** | The process reaches 18–21 GB private memory in the open world: keep the Windows page file **system-managed on an SSD** (or at least 32 GB). |
+| **Disk** | ~10 GB free on the system drive | Shader cache (`%LOCALAPPDATA%\victory\cache`, grows to ~7 GB) + build output. |
+| **Runtime libraries** | Microsoft Visual C++ 2015–2022 Redistributable (x64) | Usually already installed; get it from Microsoft if `VCRUNTIME140.dll` is reported missing. |
+| **Build tools** | [rustup](https://rustup.rs) (toolchain pinned by `rust-toolchain.toml`) + Visual Studio Build Tools (MSVC + Windows SDK) | Only to build from source. |
+| **Your own title** | A complete, lawfully obtained copy of the title you run | No title files, code or assets are provided here. |
+
+### ◆ Troubleshooting
+
+| Log line / symptom | Cause | Fix |
+|---|---|---|
+| `no host D3D12 device ... The D3D12 SDK version configuration of the host exe is invalid. (0x887E0003)`, then `D3D12SerializeVersionedRootSignature` | `D3D12\D3D12Core.dll` beside `victory.exe` is missing, not **1.620.2**, not the **x64** build, or sits in a subfolder | Run `.\tools\get-agility-sdk.ps1` (or `-ExeDir <folder>` for a `victory.exe` you moved). It copies the repository's file or downloads Microsoft's package and checks hash, version and signature. Check by hand: `Get-FileHash .\target\release\D3D12\D3D12Core.dll` must print `70A6D47D335B4A15180544C01A35B84474522A369DC582D85FE057313A3AEAA0`. |
+| `victory.exe is already running` | A previous session is still open | Close it (Task Manager) and launch again. |
+| Very slow first launch | Shader cache being built | Let it finish once; later launches reuse it. |
 
 ---
 
@@ -67,10 +83,10 @@ This fork unifies community CPU/VRAM/NVIDIA improvements from **Neptune-VE**, **
 cargo build --release -p victory
 ```
 
-This produces `target\release\victory.exe`.
+This produces `target\release\victory.exe` and copies the Agility SDK runtime to `target\release\D3D12\D3D12Core.dll`.
 
 > [!NOTE]
-> **Windows 10 users:** Obtain Microsoft's **DirectX 12 Agility SDK 1.620.2** NuGet package (`Microsoft.Direct3D.D3D12`), extract `build\native\bin\x64\D3D12Core.dll`, and place it at `target\release\D3D12\D3D12Core.dll` beside `victory.exe`.
+> `D3D12Core.dll` is Microsoft's redistributable file (Agility SDK 1.620.2, unmodified, signed by Microsoft), kept in `redist/D3D12` under Microsoft's own license (`redist/D3D12/LICENSE-Microsoft-Agility-SDK.txt`), not this repository's GPL. If you copy `victory.exe` to another folder, copy the `D3D12` folder with it or run `.\tools\get-agility-sdk.ps1 -ExeDir <folder>`.
 
 ---
 

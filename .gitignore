@@ -80,6 +80,8 @@ Thumbs.db
 # Local runtime, logs, tests, personal launchers and Agility SDK copies
 /testes/
 /D3D12/
+# Microsoft's redistributable Agility SDK runtime is kept (redist/D3D12/README.txt)
+!/redist/D3D12/D3D12Core.dll
 ambient.txt
 *.log
 *.err

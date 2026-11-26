@@ -42,11 +42,14 @@ if (Get-Process -Name victory -ErrorAction SilentlyContinue) {
     exit 1
 }
 
-# Helpful check for Windows 10 users (build < 22000 requires Agility SDK 1.620.2 D3D12Core.dll)
-$osBuild = [Environment]::OSVersion.Version.Build
-$d3dCore = Join-Path (Split-Path $exe -Parent) 'D3D12\D3D12Core.dll'
-if ($osBuild -lt 22000 -and -not (Test-Path -LiteralPath $d3dCore)) {
-    Write-Warning "Windows 10 detected (build $osBuild) without $d3dCore. Download Microsoft DirectX 12 Agility SDK 1.620.2 and place D3D12Core.dll in target\release\D3D12\ if D3D12 initialization fails."
+# DirectX 12 Agility SDK 1.620.2 (D3D12\D3D12Core.dll beside victory.exe), needed on Windows 10 AND 11:
+# victory.exe asks for SDK version 620, and without the file D3D12 fails with 0x887E0003. Installed from
+# Microsoft's official NuGet package (SHA-512 and signature checked) when missing or of another version.
+try {
+    & (Join-Path $root 'tools\get-agility-sdk.ps1') -ExeDir (Split-Path $exe -Parent)
+} catch {
+    Write-Error "Could not put the D3D12 Agility SDK in place ($($_.Exception.Message)). See README.md, Requirements and Troubleshooting, to place D3D12\D3D12Core.dll (1.620.2, x64) by hand."
+    exit 1
 }
 
 # Scale worker pools cleanly across 4C/6C/8C+ CPUs (matches 5/6 on 6C/12T)
