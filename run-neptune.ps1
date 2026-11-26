@@ -163,9 +163,9 @@ if (-not $SkipWarm) {
     $stampFile = Join-Path $cacheDir '.warmed-neptune-stamp'
     $packItem = Get-Item -LiteralPath $shaderPack -ErrorAction SilentlyContinue
     $wantStamp = if ($packItem) {
-        "neptune-v3-d16:$($packItem.Length):$($packItem.LastWriteTimeUtc.Ticks)"
+        "neptune-v2:$($packItem.Length):$($packItem.LastWriteTimeUtc.Ticks)"
     } else {
-        'neptune-v3-d16:generic'
+        'neptune-v2:generic'
     }
     $hasStamp = (-not $WarmShaders) -and (Test-Path -LiteralPath $stampFile) -and `
         ((Get-Content -LiteralPath $stampFile -Raw -ErrorAction SilentlyContinue).Trim() -eq $wantStamp)

@@ -41,9 +41,8 @@ This fork unifies community CPU/VRAM/NVIDIA improvements from **Neptune-VE**, **
 - **Shared-RAM & VRAM Pressure Trim (`VICTORY_RAM_TRIM_MB=2048`)**: Drains spare upload staging pools, idle staging buffers, and stale shadows when shared GPU memory or VRAM crosses pressure thresholds.
 - **Batched Card Sync & Indexed Submission Steps**: Integrates `VICTORY_CARD_REHASH_GAP=4`, `VICTORY_CARD_SYNC_BATCH=1`, and `VICTORY_STEP_INDEX=1` (backed by `FastMap`/`FastSet`).
 
-### 4. NVIDIA 16-Bit Typed Buffer Fix & Refresh Stamp (fused with `proneonn/Vertex`)
-- **NVIDIA 16-Bit `d16` Typed Buffer Fix (`halves.rs`, `draw.rs`, `descriptor/host.rs`, PR #927)**: Rewrites 16-bit float/signed buffer views as layout-identical `*_UINT` views (`R16G16B16A16_UINT`, `R16G16_UINT`, `R16_UINT`) where translated shaders move raw 16-bit channel patterns, fixing vertex/skinning corruption on NVIDIA GPUs while remaining compatible with `list_views`.
-- **Monotonic Refresh Stamp (`stamp.rs`, `VICTORY_REFRESH_STAMP=1`)**: Skips redundant CPU shadow-buffer refreshes when title memory has not been written since the last upload stamp.
+### 4. Refresh Stamp (fused with `proneonn/Vertex`)
+- **Monotonic Refresh Stamp (`stamp.rs`, `VICTORY_REFRESH_STAMP=1` opt-in)**: Skips redundant CPU shadow-buffer refreshes when title memory has not been written since the last upload stamp.
 
 ### 5. Windows 10 & Windows 11 Support + Diagnostics
 - **DirectX 12 Agility SDK Exports (`apps/victory/src/main.rs`)**: Exports `D3D12SDKVersion` (`620`) and `D3D12SDKPath` (`.\D3D12\`) in `victory.exe` so Windows 10 (19045+) can load modern D3D12 features when `D3D12\D3D12Core.dll` (Agility SDK `1.620.2`) is placed next to `victory.exe`.

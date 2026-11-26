@@ -249,11 +249,6 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
-    word(&mut out, s.half_views.len() as u32);
-    for &(slot, dword) in &s.half_views {
-        word(&mut out, u32::from(slot));
-        word(&mut out, dword);
-    }
     out
 }
 
@@ -322,11 +317,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    let n = r.word()? as usize;
-    let mut half_views = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
-    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -337,7 +327,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
-        half_views,
     })
 }
 
@@ -372,7 +361,6 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
-            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
