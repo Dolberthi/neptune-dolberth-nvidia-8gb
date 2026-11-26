@@ -58,6 +58,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod prof;
 pub mod query;
 pub mod queue;
 pub mod resource;

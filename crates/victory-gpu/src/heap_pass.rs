@@ -19,6 +19,16 @@
 //! `VICTORY_HEAP_PASS_FULL=1` brings back the old pass (all slots every 16
 //! passes, all spans every pass) to compare.
 
+// (Neptune) FxHash maps: the pass forgets and keeps some 19,000 slots a frame in the world,
+// with three or four lookups each, and looks at every kept slot (80,000) each frame; SipHash
+// on those `u32` and pointer keys was a share of the time the thread that sends the frame
+// waited for this pass. Nothing here depends on the maps' order: `Picked::plan` sorts what
+// it hands out, and the spans' refreshes are independent of one another.
+#[cfg(windows)]
+type HashMap<K, V> = crate::turbo::FastMap<K, V>;
+#[cfg(windows)]
+type HashSet<K> = crate::turbo::FastSet<K>;
+#[cfg(not(windows))]
 use std::collections::{HashMap, HashSet};
 
 /// Passes between two looks at every slot, besides those marked.
@@ -96,10 +106,10 @@ impl<C: Clone> Picked<C> {
     pub(crate) fn with_scan_every(full: bool, scan_every: u64) -> Self {
         Picked {
             passes: 0,
-            slots: HashMap::new(),
-            copies: HashMap::new(),
-            orphans: HashMap::new(),
-            by_entry: HashMap::new(),
+            slots: HashMap::default(),
+            copies: HashMap::default(),
+            orphans: HashMap::default(),
+            by_entry: HashMap::default(),
             forgotten: None,
             full,
             scan_every: scan_every.max(1),
@@ -226,7 +236,7 @@ impl<C: Clone> Picked<C> {
         self.slots.insert(slot, Slot { copy: key, from, to, record, unordered });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
-            slots: HashSet::new(),
+            slots: HashSet::default(),
             from,
             to,
             stale: false,
@@ -278,7 +288,7 @@ impl<C: Clone> Picked<C> {
     pub(crate) fn spans(&mut self) -> Vec<(C, u64, u64)> {
         if self.full {
             // As the old pass did: from every view, every pass.
-            let mut spans: HashMap<usize, (u64, u64)> = HashMap::new();
+            let mut spans: HashMap<usize, (u64, u64)> = HashMap::default();
             for s in self.slots.values() {
                 let span = spans.entry(s.copy).or_insert((s.from, s.to));
                 span.0 = span.0.min(s.from);

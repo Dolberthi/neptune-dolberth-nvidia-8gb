@@ -1863,10 +1863,135 @@ const PRESSED_MS: u64 = 1_000;
 const PRESSED_FRAMES: u64 = 2;
 
 /// Copies let go under pressure: how many and their bytes, for the memory
-/// line.
+/// line; then (Neptune) copies let go early because the title unmapped
+/// their source ([`note_unmapped`]): how many and their bytes.
 #[cfg(windows)]
-pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// (Neptune, after HailLucifer666 4ae2d11 + 8f73867 of the VIctory-NVIDIA
+/// 8 GB line, GPL-3.0-or-later) Whether `[a_start, a_start + a_len)` and
+/// `[b_start, b_start + b_len)` share a byte: half-open, an empty range
+/// shares nothing, the ends saturate so a range cannot wrap into a hit.
+#[cfg(windows)]
+pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    a_len > 0 && b_len > 0 && a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+/// (Neptune, after 4ae2d11 + 8f73867) The ranges of title memory the title
+/// unmapped since the last sweep, merged and sorted, or `all` when there
+/// were more of them than [`KEPT_RANGES`].
+///
+/// Unmapping is how the title says it is done with a texture. A placed
+/// texture's host copy waited out the idle time (5 s and 4 frames with
+/// room on the card) while the title streamed its next textures in, so a
+/// texture the title had finished with held its card memory through the
+/// stream, and under pressure live textures went instead of dead ones
+/// (and were made again). Here [`let_go_idle`] lets such a copy go after
+/// the pressure floor ([`PRESSED_MS`], [`PRESSED_FRAMES`]), the floor that
+/// protects a handle handed out and not yet recorded into a list or slot;
+/// the other conditions (nothing but its title texture holds it, no slot
+/// views it) are unchanged.
+///
+/// Recorded only, not acted on, at the unmapping: loading a save unmapped
+/// some five thousand times a second, and a walk of the texture table at
+/// each took 975 ms of every second on the unmapping thread (cafeoh, RTX
+/// 2080 Ti). The sweep already walks the table once a frame.
+/// Off unless `VICTORY_UNMAP_LET_GO=1`: on an 8 GB card (2026-11-26) the
+/// title unmapped more than [`KEPT_RANGES`] ranges between most sweeps, so
+/// `all` held and live textures went too: twice the textures let go and
+/// made again, twice the slots found unmapped (blurred, see-through and
+/// black surfaces until they came back).
+#[cfg(windows)]
+#[derive(Default)]
+struct Unmapped {
+    /// Sorted, non-overlapping, non-adjacent `(start, len)`.
+    ranges: Vec<(u64, u64)>,
+    /// More ranges arrived than [`KEPT_RANGES`]: every placed texture's
+    /// source is taken as gone (sound: a gone source only ever adds a
+    /// reason to let a copy go, never a reason to keep one).
+    all: bool,
+}
+
+/// How many unmapped ranges are kept between sweeps.
+#[cfg(windows)]
+const KEPT_RANGES: usize = 64;
+
+/// What [`note_unmapped`] recorded. A leaf lock: nothing else is taken
+/// while it is held.
+#[cfg(windows)]
+static UNMAPPED: std::sync::Mutex<Unmapped> = std::sync::Mutex::new(Unmapped { ranges: Vec::new(), all: false });
+
+/// Whether `[start, start + len)` shares a byte with any recorded range.
+#[cfg(windows)]
+fn unmapped_due(ranges: &[(u64, u64)], start: u64, len: u64) -> bool {
+    ranges.iter().any(|&(b_start, b_len)| ranges_overlap(start, len, b_start, b_len))
+}
+
+/// Records that the title unmapped or moved `[base, base + len)` of its
+/// memory (`crate::watch::title_memory_remapped`): the host copies of
+/// placed textures filled from there have nothing left to come from. A
+/// lock and a merge over at most [`KEPT_RANGES`] ranges, whatever the
+/// size of the texture table.
+#[cfg(windows)]
+pub(crate) fn note_unmapped(base: u64, len: u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_UNMAP_LET_GO").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")
+    });
+    if !on || len == 0 {
+        return;
+    }
+    let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    if u.all {
+        return;
+    }
+    if merge_into(&mut u.ranges, base, len) {
+        u.all = true;
+        u.ranges = Vec::new();
+    }
+}
+
+/// Puts `[base, base + len)` into the sorted, merged `ranges`, joining
+/// what it overlaps or touches. True: the list is full, and the caller
+/// must take everything as due.
+#[cfg(windows)]
+fn merge_into(ranges: &mut Vec<(u64, u64)>, base: u64, len: u64) -> bool {
+    if ranges.len() >= KEPT_RANGES {
+        return true;
+    }
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    let (mut start, mut end) = (base, base.saturating_add(len));
+    let mut put = false;
+    for &(b_start, b_len) in ranges.iter() {
+        let b_end = b_start.saturating_add(b_len);
+        if b_end < start {
+            out.push((b_start, b_len));
+        } else if b_start > end {
+            if !put {
+                out.push((start, end - start));
+                put = true;
+            }
+            out.push((b_start, b_len));
+        } else {
+            start = start.min(b_start);
+            end = end.max(b_end);
+        }
+    }
+    if !put {
+        out.push((start, end - start));
+    }
+    *ranges = out;
+    false
+}
+
+/// Takes what [`note_unmapped`] recorded, leaving nothing recorded.
+#[cfg(windows)]
+fn take_unmapped() -> Unmapped {
+    let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *u)
+}
 
 /// Host texture bytes by kind, as of the last sweep, for the memory line:
 /// textures the title fills (not placed, placed), render targets, depth,
@@ -1959,6 +2084,7 @@ fn account(idle_ms: u64) {
     const TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     let mut v = [0u64; 8];
+    let mut top = [0u64; 5];
     let mut filled_at: Vec<(usize, u64)> = Vec::new();
     for &at in textures().iter() {
         // SAFETY: as in `pressure_victims`.
@@ -1981,6 +2107,24 @@ fn account(idle_ms: u64) {
             v[5] += t.colour.bytes + t.plane.as_ref().map_or(0, |p| p.bytes);
         }
         if kind < 2 {
+            // (Neptune) The census for a cap on the largest level ([`top_mip_line`]): 2-D
+            // textures of 2048 texels or more on a side with levels below the first, held in
+            // the card's memory whole (a texture made level by level holds 0 bytes here).
+            const TEXTURE_2D: u32 = 3;
+            if host.bytes > 0
+                && r.desc.dimension == TEXTURE_2D
+                && r.desc.mip_levels > 1
+                && r.desc.width.max(u64::from(r.desc.height)) >= 2048
+            {
+                let share = top_level_share(r.desc.width, u64::from(r.desc.height), u32::from(r.desc.mip_levels));
+                top[0] += 1;
+                top[1] += host.bytes;
+                top[2] += (host.bytes as f64 * share) as u64;
+                if texture_layout(&r.desc).is_some_and(|t| t.planes[0].layout.desc.swizzle.xor()) {
+                    top[3] += 1;
+                    top[4] += host.bytes;
+                }
+            }
             filled_at.push((r.data() as usize, host.bytes));
             if crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, 4)
                 && (std::sync::Arc::strong_count(host) > 1 || crate::host::references(&host.texture) > 1)
@@ -1993,6 +2137,40 @@ fn account(idle_ms: u64) {
     for (to, now) in VRAM_KINDS.iter().zip(v) {
         to.store(now, Relaxed);
     }
+    for (to, now) in TOP_MIP.iter().zip(top) {
+        to.store(now, Relaxed);
+    }
+}
+
+/// (Neptune) Of the textures the title fills, as of the last sweep: those a cap on the
+/// largest level would touch (2-D, 2048 texels or more on a side, with smaller levels, held
+/// whole in the card's memory), their bytes, the bytes their first level takes (what
+/// dropping it would give back), and of them the ones in an XOR mode and their bytes.
+#[cfg(windows)]
+pub(crate) static TOP_MIP: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The share of a `width` x `height` texture's `mips` levels that its first level takes,
+/// counted in 4x4 blocks (the smallest a block-compressed level takes).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn top_level_share(width: u64, height: u64, mips: u32) -> f64 {
+    let blocks = |level: u32| ((width >> level).max(1).div_ceil(4) * (height >> level).max(1).div_ceil(4)) as f64;
+    let all: f64 = (0..mips.min(16)).map(blocks).sum();
+    if all > 0.0 { blocks(0) / all } else { 0.0 }
+}
+
+/// (Neptune) The line of [`TOP_MIP`], with the memory line: what a cap on the largest level
+/// of big textures would give back, measured (decides whether such a cap is worth making).
+#[cfg(windows)]
+pub(crate) fn top_mip_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [n, bytes, first, xor_n, xor_bytes] = [0, 1, 2, 3, 4].map(|i| TOP_MIP[i].load(Relaxed));
+    tracing::info!(
+        "big textures the title fills, held whole on the card (2-D, 2048 or more on a side, with smaller levels): {n} textures {} MB, \
+         their first levels {} MB (what dropping the first level would give back); in an XOR mode {xor_n} textures {} MB",
+        bytes >> 20,
+        first >> 20,
+        xor_bytes >> 20
+    );
 }
 
 /// The bytes of `copies` (address, bytes) beyond the first at each address.
@@ -2039,6 +2217,9 @@ pub(crate) fn let_go_idle() {
     // Under pressure (`VICTORY_VRAM_EVICT`): the least recently used copies
     // that are idle by the shorter measure go, enough to get under it.
     let pressed = pressure_victims(video);
+    // (Neptune) What the title unmapped since the last sweep ([`note_unmapped`]):
+    // taken before the table's lock, and its own lock is a leaf.
+    let unmapped = take_unmapped();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2050,10 +2231,24 @@ pub(crate) fn let_go_idle() {
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
         }
+        // (Neptune) A placed texture whose source the title unmapped: its copy
+        // waits only the pressure floor. A texture nothing touched costs one
+        // check against at most [`KEPT_RANGES`] ranges.
+        let source_gone = if !r.host.placed.load(Relaxed) {
+            false
+        } else if unmapped.all {
+            true
+        } else if unmapped.ranges.is_empty() {
+            false
+        } else {
+            let size = footprint(&r.desc).map_or(0, |f| f.size);
+            unmapped_due(&unmapped.ranges, r.data() as u64, size)
+        };
+        let pressed_here = pressed.binary_search(&at).is_ok();
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                let (ms, frames) = if pressed.binary_search(&at).is_ok() {
+                let (ms, frames) = if pressed_here || source_gone {
                     (PRESSED_MS, PRESSED_FRAMES)
                 } else {
                     (idle_ms, IDLE_FRAMES)
@@ -2075,9 +2270,12 @@ pub(crate) fn let_go_idle() {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
-            if pressed.binary_search(&at).is_ok() {
+            if pressed_here {
                 EVICTED[0].fetch_add(1, Relaxed);
                 EVICTED[1].fetch_add(host.bytes, Relaxed);
+            } else if source_gone {
+                EVICTED[2].fetch_add(1, Relaxed);
+                EVICTED[3].fetch_add(host.bytes, Relaxed);
             }
             went += 1;
             bytes += host.bytes;

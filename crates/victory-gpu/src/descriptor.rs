@@ -227,6 +227,8 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // (Neptune) The write-watch question and the pages it names (`crate::prof`, `sync_watch`).
+        let watched = std::time::Instant::now();
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -235,6 +237,7 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        crate::prof::lap(crate::prof::S::SyncWatch, watched);
         if parts.is_empty() {
             continue;
         }
@@ -245,38 +248,54 @@ pub(crate) fn sync_heaps() {
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut asked: Vec<u32> = Vec::new();
             let (mut c_pages, mut c_looked, mut c_mirrored) = (0u64, 0u64, 0u64);
+            // (Neptune) This chunk's reading and choosing (`sync_pages`) and its compare and
+            // mirror (`sync_mirror`), summed over the threads that ran chunks; and what it
+            // mirrored, for the census line, added once at its end.
+            let (mut paged_us, mut mirrored_us) = (0u64, 0u64);
+            let mut census = [0u64; 32];
             for &(from, to) in chunk {
+                let paging = std::time::Instant::now();
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 c_looked += slots.end - slots.start;
                 host.not_left_to_draws(slots, &mut asked);
                 c_pages += 1;
                 if asked.is_empty() {
+                    paged_us += paging.elapsed().as_micros() as u64;
                     continue;
                 }
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    // Fast path: skip untouched all-zero 4 KiB pages with AVX2.
-                    if crate::turbo::is_all_zero(&page_bytes) && unsafe { prints.all_unseen(&asked) } {
+                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
+                // Fast path: skip untouched all-zero 4 KiB pages with AVX2.
+                let skip = !read || (crate::turbo::is_all_zero(&page_bytes) && unsafe { prints.all_unseen(&asked) });
+                let mirroring = std::time::Instant::now();
+                paged_us += mirroring.saturating_duration_since(paging).as_micros() as u64;
+                if skip {
+                    continue;
+                }
+                for &index in &asked {
+                    let idx64 = u64::from(index);
+                    let handle = start + idx64 * step;
+                    // A record that straddles the range's ends is left
+                    // to the range that holds its first byte.
+                    let Some(at) = (handle as usize).checked_sub(from) else {
                         continue;
-                    }
-                    for &index in &asked {
-                        let idx64 = u64::from(index);
-                        let handle = start + idx64 * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        // SAFETY: disjoint pages have disjoint slot indices.
-                        if unsafe { host.mirror_copied_in(&prints, index, handle, record) } {
-                            c_mirrored += 1;
-                        }
+                    };
+                    let Some(record) = page_bytes.get(at..at + step as usize) else {
+                        continue;
+                    };
+                    // SAFETY: disjoint pages have disjoint slot indices.
+                    if unsafe { host.mirror_copied_in(&prints, index, handle, record, &mut census) } {
+                        c_mirrored += 1;
                     }
                 }
+                mirrored_us += mirroring.elapsed().as_micros() as u64;
             }
+            if c_mirrored != 0 {
+                host::add_copied_census(&census);
+            }
+            crate::prof::add_us(crate::prof::S::SyncPages, paged_us);
+            crate::prof::add_us(crate::prof::S::SyncMirror, mirrored_us);
+            crate::prof::count(crate::prof::C::SyncMirrored, c_mirrored);
             (c_pages, c_looked, c_mirrored)
         };
         const SYNC_CHUNK: usize = 4;

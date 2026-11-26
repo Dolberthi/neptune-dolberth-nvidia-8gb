@@ -374,6 +374,36 @@ fn window_card_most() -> u64 {
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// (Neptune) Up to how many hundredths of the card's budget a window may still go to the card's
+/// memory (`VICTORY_CARD_WINDOWS_ROOM`, default 80: a fifth kept free, as before; 50 to 97).
+///
+/// On an 8 GB card the texture queue fills the card to its own line (nine tenths and more of
+/// the budget) while the world loads, before most windows are made: with a fifth kept free none
+/// of them goes up, and every draw then reads its vertices, indices and constants over the bus
+/// (a PC with PCIe 3.0 x8: under 8 GB/s for all of it). A window is read by many draws every
+/// frame and a texture's top level by few, so with this above the texture queue's line
+/// (`VICTORY_TEXTURE_ROOM_PERCENT`) the windows get the card first and the textures wait.
+fn window_room_hundredths() -> u64 {
+    static ROOM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_ROOM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(50, 97))
+    })
+}
+
+/// (Neptune) Whether a window of `size` bytes fits on the card by [`window_room_hundredths`];
+/// with no numbers from the system, it does.
+fn window_room(host: &crate::host::Host, size: u64) -> bool {
+    host.video_memory()
+        .is_none_or(|[budget, used, ..]| used + size <= budget / 100 * window_room_hundredths())
+}
+
+/// (Neptune) Windows turned down for the card's room since the start, and their bytes (they stay
+/// in the PC's memory, read over the bus, for as long as the title keeps them).
+pub(crate) static WINDOW_ROOM_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
@@ -385,13 +415,17 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
+    let refused = || {
+        WINDOW_ROOM_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_ROOM_REFUSED[1].fetch_add(size, Ordering::Relaxed);
+    };
+    if !window_room(host, size) {
+        refused();
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        refused();
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -425,7 +459,7 @@ fn window_rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let most = window_card_most();
-    let room = most != 0 && host.video_memory().is_none_or(|[budget, used, ..]| used + size <= budget / 10 * 8);
+    let room = most != 0 && window_room(host, size);
     if !room || WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         if room {
             WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);

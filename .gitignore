@@ -86,4 +86,6 @@ ambient.txt
 *.dmp
 jogar-neptune.ps1
 teste-neptune.ps1
+perfil-neptune.ps1
+neptune-bench.ps1
 PUBLICAR-GITHUB.md

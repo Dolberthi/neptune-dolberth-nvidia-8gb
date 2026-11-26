@@ -153,7 +153,9 @@ fn present_later() -> bool {
     let Some(job) = lock(&LATER.0).job.take() else {
         return false;
     };
+    let began = std::time::Instant::now();
     job();
+    crate::prof::lap(crate::prof::S::Present, began);
     // What the title gave its queues meanwhile, into their lines.
     let next = {
         let mut later = lock(&LATER.0);
@@ -198,16 +200,23 @@ fn wake_releaser() {
             RELEASER.with(|mine| mine.set(true));
             loop {
                 {
+                    // (Neptune) Time with nothing to do (`crate::prof`, `idle`).
+                    let idle = std::time::Instant::now();
                     let mut wake = lock(&WAKE.0);
                     while !*wake {
                         wake = WAKE.1.wait(wake).unwrap_or_else(|e| e.into_inner());
                     }
                     *wake = false;
+                    drop(wake);
+                    crate::prof::lap(crate::prof::S::Idle, idle);
                 }
+                // (Neptune) The thread's busy time (`lines`): with `idle`, all of its time.
+                let busy = std::time::Instant::now();
                 release_held(false);
                 while present_later() {
                     release_held(false);
                 }
+                crate::prof::lap(crate::prof::S::Lines, busy);
             }
         });
         if let Err(e) = made {
@@ -557,7 +566,9 @@ pub(crate) fn release_held(all: bool) {
                         // lock (the title's calls for this queue go behind them).
                         let recordings = recordings.clone();
                         drop(held);
+                        let waited = std::time::Instant::now();
                         recordings.iter().for_each(|r| r.wait());
+                        crate::prof::lap(crate::prof::S::WaitTranslations, waited);
                         held = lock(held_of);
                         continue;
                     }
@@ -712,6 +723,7 @@ fn ahead_of_frame(host: &crate::host::Host) {
         }
     };
     AHEAD_WAITED.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    crate::prof::lap(crate::prof::S::WaitAhead, began);
     if let Some(ahead) = ahead {
         host.execute_late(vec![ahead], vec![0]);
     }

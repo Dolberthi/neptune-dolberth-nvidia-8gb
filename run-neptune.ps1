@@ -22,7 +22,8 @@ param(
     [switch]$WarmShaders,
     [switch]$SkipWarm,
     [switch]$Dred,
-    [switch]$BelowNormal
+    [switch]$BelowNormal,
+    [switch]$NoGpuLog
 )
 
 $ErrorActionPreference = 'Stop'
@@ -192,6 +193,25 @@ $prev = Join-Path $env:TEMP 'neptune-prev.log'
 if (Test-Path $log) { Move-Item -Force $log $prev }
 if (Test-Path "$log.err") { Move-Item -Force "$log.err" "$prev.err" }
 
+# Real GPU utilization for neptune-diag.ps1 (NVIDIA only: nvidia-smi from PATH, 1 sample/s,
+# hidden window, stopped when the session ends). The frame line's "gpu %" is only the time
+# the CPU waited for the card. -NoGpuLog skips it.
+$gpuCsv = Join-Path $env:TEMP 'neptune-gpu.csv'
+$gpuPid = Join-Path $env:TEMP 'neptune-gpu.pid'
+if (Test-Path $gpuPid) {
+    $old = Get-Content $gpuPid -ErrorAction SilentlyContinue
+    if ($old) { Get-Process -Id $old -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq 'nvidia-smi' } | Stop-Process -Force -ErrorAction SilentlyContinue }
+}
+$gpuMon = $null
+$smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+if ($smi -and -not $NoGpuLog) {
+    Remove-Item $gpuCsv -ErrorAction SilentlyContinue
+    $gpuMon = Start-Process -FilePath $smi.Source -WindowStyle Hidden -PassThru -ArgumentList @(
+        '--query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total,clocks.sm,power.draw',
+        '--format=csv,noheader,nounits', '-lms', '1000', '-f', "`"$gpuCsv`"")
+    if ($gpuMon) { Set-Content -Path $gpuPid -Value $gpuMon.Id }
+}
+
 $argv = @('run', "`"$Title`"", '--execute') + $console
 $p = Start-Process -FilePath $exe -ArgumentList $argv `
     -WorkingDirectory (Split-Path $exe -Parent) `
@@ -200,4 +220,6 @@ $p = Start-Process -FilePath $exe -ArgumentList $argv `
 if ($BelowNormal) { $p.PriorityClass = 'BelowNormal' }
 Write-Output "Neptune HyperEngine by Dolberth started (PID $($p.Id), profile=$($console[1]), log=$log.err)"
 $p.WaitForExit()
-Write-Output "Neptune HyperEngine by Dolberth exited (code $($p.ExitCode))."
+if ($gpuMon -and -not $gpuMon.HasExited) { Stop-Process -Id $gpuMon.Id -Force -ErrorAction SilentlyContinue }
+Remove-Item $gpuPid -ErrorAction SilentlyContinue
+Write-Output "Neptune HyperEngine by Dolberth exited (code $($p.ExitCode)). Diagnostics: .\neptune-diag.ps1"

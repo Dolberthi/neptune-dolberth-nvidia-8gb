@@ -278,7 +278,7 @@ pub(crate) fn log() {
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
     let htex = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
     let vk: Vec<u64> = crate::resource::VRAM_KINDS.iter().map(|k| k.load(Relaxed)).collect();
-    let ev = [0, 1].map(|i| crate::resource::EVICTED[i].load(Relaxed));
+    let ev = [0, 1, 2, 3].map(|i| crate::resource::EVICTED[i].load(Relaxed));
     let sev: Vec<u64> = crate::resource::SLOT_EVICT.iter().map(|k| k.load(Relaxed)).collect();
     let card_copies = crate::shadow::card_copy_bytes();
     let card = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
@@ -313,6 +313,7 @@ pub(crate) fn log() {
          card copies {} MB (before twins {} MB); card (VRAM) {} MB in use of {} MB budget, shared {} MB in use; \
          host texture VRAM by kind: filled {} MB, filled placed {} MB, targets {} MB, depth {} MB, uav {} MB, twins {} MB, \
          filled idle but held {} MB, filled duplicates at one address {} MB; evicted under pressure {} {} MB; \
+         let go early after the title unmapped their source (VICTORY_UNMAP_LET_GO) {} {} MB; \
          evicted with slots (VICTORY_SLOT_EVICT) {} textures {} MB, {} slots reset, {} came back ({} within 2 s, away {} ms in all), {} given up{}{}",
         mb(c.WorkingSetSize as u64),
         mb(c.PagefileUsage as u64),
@@ -361,6 +362,8 @@ pub(crate) fn log() {
         mb(vk[7]),
         ev[0],
         mb(ev[1]),
+        ev[2],
+        mb(ev[3]),
         sev[0],
         mb(sev[1]),
         sev[2],

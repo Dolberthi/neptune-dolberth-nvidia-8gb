@@ -134,7 +134,8 @@ pub(crate) struct HostHeap {
     buffers: Mutex<std::collections::BTreeSet<u32>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    /// (Neptune) FxHash: written for every buffer view a write or a mirror changes.
+    changed: Mutex<crate::turbo::FastSet<u32>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -251,13 +252,16 @@ pub(crate) struct Spans {
     // rule for packed neighbours. Its questions for levels on demand (`first_viewed`,
     // `next_start`, `slots_at`, `slots_holding`) are answered from this one.
     spans: std::collections::BTreeMap<(u64, u64), ([u32; 14], std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, (u64, u64)>,
+    // (Neptune) FxHash for the three below: asked for every placed texture view written or
+    // mirrored, under the heap's `placed` lock (`sizes` hashed 60 bytes with SipHash each
+    // time). Their order is never walked.
+    by_slot: crate::turbo::FastMap<u32, (u64, u64)>,
     /// The level each slot's view starts at ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, u32>,
+    first: crate::turbo::FastMap<u32, u32>,
     /// The bytes a placed texture takes, by resource description and first
     /// mip: worked out once for each (a title writes the views of a few
     /// thousand descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<([u32; 14], u32), Option<u64>>,
+    sizes: crate::turbo::FastMap<([u32; 14], u32), Option<u64>>,
 }
 
 /// The first bytes of a texture's memory hold its smallest levels: a texture that starts
@@ -2465,6 +2469,7 @@ impl HostHeap {
         index: u32,
         handle: u64,
         record: &[u8],
+        census: &mut [u64; 32],
     ) -> bool {
         if index >= self.count {
             return false;
@@ -2481,35 +2486,28 @@ impl HostHeap {
         if tag != VIEW_TAG && self.shows_none(index) {
             return false;
         }
-        {
-            use std::sync::atomic::Ordering::Relaxed;
-            let word = |at: usize| {
-                record
-                    .get(at..at + 4)
-                    .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-            };
-            let view = (tag == VIEW_TAG)
-                .then(|| view_at(word(4), word(8)))
-                .flatten();
-            let buffer = |r: usize| {
-                usize::from(crate::resource::buffer_bytes(r as crate::object::This).is_some())
-            };
-            let kind = match &view {
-                None => 0,
-                Some(View::Constant(..)) => 1,
-                Some(View::Shader(r, _)) => 2 + buffer(*r),
-                Some(View::Unordered(r, _, _)) => 4 + buffer(*r),
-                Some(View::Sampler(_) | View::ConsoleSampler(_)) => 6,
-                Some(View::Placed(false, ..)) => 7,
-                Some(View::Placed(true, ..)) => 8,
-            };
-            COPIED_CENSUS[kind].fetch_add(1, Relaxed);
-            if self.tabled_stamp(index) != 0 {
-                COPIED_CENSUS[9].fetch_add(1, Relaxed);
-            }
-            COPIED_CENSUS[10 + (index as usize >> 16).min(21)].fetch_add(1, Relaxed);
+        // (Neptune) What was mirrored, for the log line (`COPIED_CENSUS`), from the view the
+        // mirror itself found: the census looked the view up a second time (a read of the
+        // views' table under its lock, and a copy of the view) for each of the 13,000
+        // records a frame this pass mirrors on the thread that sends the frame, and added
+        // to three shared counters each time. Counted in `census` (the caller's chunk) and
+        // added once a chunk ([`add_copied_census`]).
+        let view = self.mirror(index, handle, false);
+        let buffer = |r: usize| usize::from(crate::resource::buffer_bytes(r as crate::object::This).is_some());
+        let kind = match &view {
+            None => 0,
+            Some(View::Constant(..)) => 1,
+            Some(View::Shader(r, _)) => 2 + buffer(*r),
+            Some(View::Unordered(r, _, _)) => 4 + buffer(*r),
+            Some(View::Sampler(_) | View::ConsoleSampler(_)) => 6,
+            Some(View::Placed(false, ..)) => 7,
+            Some(View::Placed(true, ..)) => 8,
+        };
+        census[kind] += 1;
+        if self.tabled_stamp(index) != 0 {
+            census[9] += 1;
         }
-        self.mirror(index, handle, false);
+        census[10 + (index as usize >> 16).min(21)] += 1;
         true
     }
 
@@ -2917,6 +2915,15 @@ fn sync_tables() -> bool {
 /// 5 unordered buffer, 6 sampler, 7 placed, 8 placed unordered), then (9) those whose slot a
 /// table read at some time, then by where in the heap (the slot's number in 65,536s).
 pub(crate) static COPIED_CENSUS: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+
+/// (Neptune) Adds a chunk's counts ([`HostHeap::mirror_copied_in`]) to [`COPIED_CENSUS`].
+pub(crate) fn add_copied_census(census: &[u64; 32]) {
+    for (to, &n) in COPIED_CENSUS.iter().zip(census) {
+        if n != 0 {
+            to.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
@@ -3974,7 +3981,8 @@ struct ListViews {
     _heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
-    made: std::collections::HashMap<[u32; 3], ListView>,
+    /// (Neptune) FxHash: looked up for every slot of every table a recording thread makes.
+    made: crate::turbo::FastMap<[u32; 3], ListView>,
 }
 
 impl ListViews {

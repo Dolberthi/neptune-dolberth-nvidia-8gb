@@ -260,6 +260,28 @@ fn absent_one(block: usize) -> bool {
     part_of(&ABSENT, block, false).is_some_and(|part| part.0[block % PART].load(std::sync::atomic::Ordering::Acquire) != 0)
 }
 
+/// (Neptune) The protected blocks of the guards again (`Guards::protected`), as [`ABSENT`] is of
+/// the absent ones, written under the guards' lock with the set. [`known_view`] asks before each
+/// kernel asking of [`ask_once`] whether a range starts in view memory, and behind the guards'
+/// lock it waited for every write fault and every guard being set or opened: in a profile of the
+/// first mission (26/11) the submitting thread stood there 1.1 s of 20, more than in the kernel
+/// asking itself. A look that comes before a change of the set is no worse than one made just
+/// before the lock is taken: a block guarded meanwhile makes the kernel asking fail (as for any
+/// view), and a block opened meanwhile is still view memory, which is not write-watched.
+static PROTECTED: [std::sync::atomic::AtomicPtr<Part>; 1 << 16] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+
+/// Notes `block` protected or not, with `Guards::protected`.
+fn protected_set(block: usize, protected: bool) {
+    if let Some(part) = part_of(&PROTECTED, block, protected) {
+        part.0[block % PART].store(u64::from(protected), std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn protected_one(block: usize) -> bool {
+    part_of(&PROTECTED, block, false).is_some_and(|part| part.0[block % PART].load(std::sync::atomic::Ordering::Acquire) != 0)
+}
+
 /// Notes `block` clean or not, with `Guards::clean`.
 fn clean_set(block: usize, clean: bool) {
     if let Some(part) = part_of(&CLEAN, block, clean) {
@@ -1302,9 +1324,9 @@ fn known_view(start: usize) -> bool {
     if ask {
         return false;
     }
-    let g = guards_read();
+    // (Neptune) Without the guards' lock: the tables mirror the sets ([`PROTECTED`]).
     let block = start / BLOCK;
-    g.protected.contains(&block) || g.absent.contains(&block)
+    protected_one(block) || absent_one(block)
 }
 
 struct Guards {
@@ -1587,6 +1609,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        protected_set(block, true);
     }
 }
 
@@ -1608,7 +1631,10 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
-        (from..to).for_each(|block| clean_set(block, true));
+        (from..to).for_each(|block| {
+            clean_set(block, true);
+            protected_set(block, true);
+        });
     };
     count(1, 1);
     count(2, (to - from) as u64);
@@ -1690,6 +1716,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     };
     for &block in &blocks {
         g.protected.remove(&block);
+        protected_set(block, false);
         g.clean.remove(&block);
         clean_set(block, false);
         run = match run {
@@ -1996,6 +2023,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // (Neptune) Host copies of placed textures there have nothing left to come
+    // from: recorded here (a leaf lock, before the guards' lock), let go by
+    // the next sweep ([`crate::resource::note_unmapped`]).
+    crate::resource::note_unmapped(at as u64, len as u64);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     if guard_hot() > 0 {
@@ -2021,6 +2052,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+        protected_set(block, false);
         g.clean.remove(&block);
         clean_set(block, false);
     }
