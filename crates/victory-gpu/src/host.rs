@@ -236,25 +236,24 @@ pub(crate) fn vram_idle_ms_by_room(video_memory: Option<[u64; 4]>, room: bool) -
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low OR when card VRAM / shared GPU memory is
-/// under pressure (prevents multi-GB window accumulation and PCIe paging).
+/// only under real physical-RAM or near-OOM VRAM pressure (avoids buffer
+/// destroy/recreate thrashing on 8 GB VRAM / 16 GB RAM PCs).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
-    const MODERATE_MS: u64 = 4_000;
-    const HIGH_MS: u64 = 1_500;
-    if let Some([budget, used, _, shared_used]) = host().and_then(|h| h.video_memory()) {
-        let vram_high = budget > 0 && used.saturating_mul(100) >= budget.saturating_mul(80);
-        if vram_high || shared_used >= 2 * GIB {
+    const MODERATE_MS: u64 = 5_000;
+    const HIGH_MS: u64 = 2_000;
+    if let Some([budget, used, ..]) = host().and_then(|h| h.video_memory()) {
+        if budget > 0 && used.saturating_mul(100) >= budget.saturating_mul(94) {
             return HIGH_MS;
         }
     }
     let Some(avail) = avail_phys else {
         return NORMAL_MS;
     };
-    if avail < 2 * GIB {
+    if avail < GIB {
         HIGH_MS
-    } else if avail < 4 * GIB {
+    } else if avail < 3 * GIB {
         MODERATE_MS
     } else {
         NORMAL_MS
@@ -1656,7 +1655,9 @@ pub(crate) fn record_upscale(
         return false;
     };
     static TAA_ON: OnceLock<bool> = OnceLock::new();
-    let taa_wanted = *TAA_ON.get_or_init(|| std::env::var_os("VICTORY_TAA").is_none_or(|v| v != "0"));
+    // Default off (spatial Anti-Crumb + FXAA 3.11 = sharp, zero motion-vector face smear);
+    // opt-in with VICTORY_TAA=1.
+    let taa_wanted = *TAA_ON.get_or_init(|| std::env::var_os("VICTORY_TAA").is_some_and(|v| v == "1"));
     let hist = if taa_wanted {
         upscale_history(&host.device, to.Width as u32, to.Height, out_fmt)
     } else {

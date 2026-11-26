@@ -14,8 +14,8 @@ param(
     [string]$Window = 'fullscreen',
     [string]$Ambient = '',
     [switch]$SeriesX,
-    [string]$TextureMaxDim = '1024',
-    [switch]$NoTaa,
+    [string]$TextureMaxDim = '0',
+    [switch]$Taa,
     [switch]$NoThin,
     [switch]$SyncSubmit,
     [switch]$RawIndirect,
@@ -62,12 +62,12 @@ $set = [ordered]@{
     VICTORY_TEXTURE_ROOM_PERCENT     = '88'
     VICTORY_TEXTURE_HEAPS            = '1'
     VICTORY_SLOT_EVICT               = '1'
-    VICTORY_SLOT_EVICT_PERCENT       = '78'
-    VICTORY_SLOT_EVICT_MB            = '512'
-    VICTORY_VRAM_EVICT               = '82'
-    VICTORY_VRAM_IDLE_MS             = '6000,1500,500'
+    VICTORY_SLOT_EVICT_PERCENT       = '90'
+    VICTORY_SLOT_EVICT_MB            = '256'
+    VICTORY_VRAM_EVICT               = '92'
+    VICTORY_VRAM_IDLE_MS             = '15000,4000,1500'
     VICTORY_TEXTURE_MAX_DIM          = $TextureMaxDim
-    VICTORY_RAM_TRIM_MB              = '2048'
+    VICTORY_RAM_TRIM_MB              = '512'
     VICTORY_LIST_POOL_MB             = '384'
     VICTORY_LIST_POOL_MOST           = '768'
     VICTORY_LIST_POOL_IDLE_S         = '10'
@@ -109,8 +109,8 @@ $set = [ordered]@{
     VICTORY_CARD_REHASH_GAP          = '4'
     VICTORY_CARD_SYNC_BATCH          = '1'
     VICTORY_STEP_INDEX               = '1'
-    VICTORY_REFRESH_STAMP            = '1'
-    VICTORY_TAA                      = $(if ($NoTaa) { '0' } else { '1' })
+    VICTORY_REFRESH_STAMP            = '0'
+    VICTORY_TAA                      = $(if ($Taa) { '1' } else { '0' })
     VICTORY_JOIN_COPIES              = '1'
     VICTORY_WINDOW_TAILS             = '1'
     VICTORY_WINDOW_KB                = '1024'

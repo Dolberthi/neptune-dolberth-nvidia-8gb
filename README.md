@@ -101,10 +101,10 @@ This produces `target\release\victory.exe`.
 
 | Switch | Default (`run-neptune.ps1`) | Description |
 |:--|:--|:--|
-| `VICTORY_TEXTURE_MAX_DIM` | `1024` | Caps max texture dimension (`1024` for 8 GB GPUs; `2048` sharper; `0` uncapped) |
-| `VICTORY_RAM_TRIM_MB` | `2048` | Trims idle staging/VRAM pools when shared GPU RAM exceeds threshold |
-| `VICTORY_TAA` | `1` | Enables built-in Clear-TAA temporal resolve (`0` = spatial anti-crumb + FXAA only) |
-| `VICTORY_REFRESH_STAMP` | `1` | Skips unchanged shadow-buffer refreshes using monotonic write stamps |
+| `VICTORY_TEXTURE_MAX_DIM` | `0` | Optional texture mip cap (`1024`/`2048` to reduce non-XOR mip memory; `0` default for highest FPS) |
+| `VICTORY_RAM_TRIM_MB` | `512` | Emergency idle-pool trim only when free physical RAM drops below threshold (avoids buffer thrashing) |
+| `VICTORY_TAA` | `0` | Spatial Anti-Crumb + FXAA 3.11 by default (zero ghosting); set `1` / `-Taa` to enable temporal resolve |
+| `VICTORY_REFRESH_STAMP` | `0` | Optional monotonic shadow-refresh stamp (experimental opt-in `1`) |
 | `VICTORY_STEP_INDEX` | `1` | O(1) indexed submission step tracking (`FastMap`/`FastSet`) |
 | `VICTORY_CARD_REHASH_GAP` | `4` | Joins nearby dirty buffer sub-ranges before rehashing |
 | `VICTORY_CARD_SYNC_BATCH` | `1` | Coalesces card buffer sync + rehash passes |
