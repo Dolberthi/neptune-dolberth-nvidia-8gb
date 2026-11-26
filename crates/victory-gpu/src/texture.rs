@@ -79,7 +79,7 @@ pub(crate) struct Staging {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<u128>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -269,6 +269,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
+    #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
@@ -529,11 +530,52 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// texture, kept so that an unchanged texture is not uploaded again, and
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
+/// Optional maximum texture dimension (`VICTORY_TEXTURE_MAX_DIM`, e.g. `1024`
+/// or `2048`; off by default). When set alongside `VICTORY_LEVELS_ON_DEMAND=1`,
+/// large 2D placed textures skip allocating VRAM tiles and CPU-detiling mip
+/// levels above this dimension, cutting VRAM and detile CPU time by ~75% on
+/// 2K/4K textures for 8 GB VRAM / 16 GB RAM PCs.
+pub(crate) fn max_dim() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX_DIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n.max(64))
+    })
+}
+
+/// Lowest mip level of a `width x height` texture with `mips` levels whose
+/// dimensions do not exceed `cap` (always keeps at least the coarsest level).
+pub(crate) fn capped_first_mip(width: u32, height: u32, mips: usize, cap: u32) -> usize {
+    if mips <= 1 {
+        return 0;
+    }
+    let mut level = 0usize;
+    while level + 1 < mips && ((width >> level).max(1) > cap || (height >> level).max(1) > cap) {
+        level += 1;
+    }
+    level
+}
+
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    if crate::host::ram_pressure() {
+        let mut pool = STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.bytes > 0 {
+            let bytes = pool.bytes;
+            let count: usize = pool.free.iter().map(Vec::len).sum();
+            pool.free.clear();
+            pool.bytes = 0;
+            crate::host::trail(|| {
+                format!("ram-trim: drained {count} spare texture staging buffers ({} MiB)", bytes >> 20)
+            });
+        }
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -737,7 +779,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
-        if crate::host::dred_on() {
+        #[cfg(feature = "diagnostics")]
+        {
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
@@ -752,7 +795,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
                         d.Format.0,
                         d.MipLevels,
                         staging.footprints.len(),
-                        len,
+                        staging.total,
                         footprint.Offset,
                         f.Width,
                         f.Height,
@@ -966,6 +1009,10 @@ impl Staging {
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
         }
+        let first = match max_dim() {
+            Some(cap) => first.max(capped_first_mip(self.layout.desc.width, self.layout.desc.height, mips.len(), cap) as u64),
+            None => first,
+        };
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
@@ -1034,6 +1081,33 @@ impl Staging {
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+    }
+
+    /// Refreshes a batch of textures in parallel across worker threads
+    /// (`VICTORY_TEXTURE_BATCH=0` runs them sequentially).
+    pub(crate) fn refresh_all(items: &[&std::sync::Arc<Staging>]) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let parallel = *BATCH.get_or_init(|| {
+            std::env::var_os("VICTORY_TEXTURE_BATCH").is_none_or(|v| v != "0")
+        });
+        if !parallel || items.len() <= 1 {
+            for s in items {
+                s.refresh();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let bytes = AtomicUsize::new(0);
+        crate::turbo::parallel_for(items.len(), |i| {
+            let local = items[i].refresh_now();
+            if local > 0 {
+                bytes.fetch_add(local, Relaxed);
+            }
+        });
+        let preparing = &crate::host::PREPARING;
+        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[3].fetch_add(bytes.load(Relaxed) as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
@@ -1139,12 +1213,12 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = crate::turbo::fast_hash_128(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if crate::turbo::is_all_zero(read) {
                     return false;
                 }
                 self.detile(read);
@@ -1159,7 +1233,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = crate::turbo::fast_hash_128(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1178,7 +1252,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = crate::turbo::fast_hash_128(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1237,7 +1311,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = crate::turbo::fast_hash_128(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1289,8 +1363,12 @@ impl Staging {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if mip < 32 && held & (1 << mip) == 0 {
-                // Not the title's: zeros, not what lies in that memory.
-                linear.fill(0);
+                // Non-packed mips above `first_tail_mip` have no tiles mapped
+                // (D3D12 Tier 2 drops writes to unmapped tiles): skip zeroing
+                // multi-megabyte mip 0/1 staging slices on CPU.
+                if mip >= self.layout.first_tail_mip {
+                    linear.fill(0);
+                }
                 continue;
             }
             if let Err(e) =

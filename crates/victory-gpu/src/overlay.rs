@@ -421,7 +421,7 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     let hardware = [
         short_cpu(&stats.cpu_name),
         short_gpu(&stats.gpu_name),
-        format!("{:.0} GB RAM  \u{b7}  build {}", stats.ram.2.round(), option_env!("VICTORY_BUILD").unwrap_or("?")),
+        format!("{:.0} GB RAM  \u{b7}  Dolberth  \u{b7}  build {}", stats.ram.2.round(), option_env!("VICTORY_BUILD").unwrap_or("?")),
     ];
     let fps_text = format!("{:.0}", stats.fps);
     let ms_text = format!("{:.1} ms", stats.ms);

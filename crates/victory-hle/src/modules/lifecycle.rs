@@ -73,7 +73,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = fit(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -99,7 +99,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = fit(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -115,20 +115,84 @@ pub extern "system" fn CreateWindowExA(
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+fn fit(
+    parent: HWND,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, i32, i32, i32, i32) {
+    if parent.is_null() && requested_fullscreen() {
+        // SAFETY: plain screen-size queries.
+        let (sw, sh) = unsafe {
+            (
+                wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            )
+        };
+        if sw > 0 && sh > 0 {
+            tracing::info!(
+                width,
+                height,
+                to = ?(sw, sh),
+                "title window set to borderless fullscreen by VICTORY_WINDOW_SIZE=fullscreen"
+            );
+            let popup = (style
+                & !(wm::WS_CAPTION
+                    | wm::WS_THICKFRAME
+                    | wm::WS_SYSMENU
+                    | wm::WS_BORDER
+                    | wm::WS_DLGFRAME))
+                | wm::WS_POPUP
+                | wm::WS_VISIBLE;
+            return (popup, 0, 0, sw, sh);
+        }
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
+    if parent.is_null() && known != 0 && width > 0 && height > 0 {
+        if let Some((want_w, want_h)) = requested_window() {
+            let (w, h) = fit_into(&area, want_w, want_h);
+            tracing::info!(width, height, to = ?(w, h), "title window sized by VICTORY_WINDOW_SIZE");
+            let left = area.left + (area.right - area.left - w) / 2;
+            let top = area.top + (area.bottom - area.top - h) / 2;
+            return (style, left, top, w, h);
+        }
+    }
     let fitted = fit_into(&area, width, height);
     if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+        return (style, x, y, width, height);
     }
     tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
-    (left, top, w, h)
+    (style, left, top, w, h)
+}
+
+/// Whether `VICTORY_WINDOW_SIZE` asks for borderless fullscreen (`fullscreen`/`full`).
+fn requested_fullscreen() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_SIZE").is_ok_and(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("fullscreen") || v.eq_ignore_ascii_case("full")
+        })
+    })
+}
+
+/// The window size `VICTORY_WINDOW_SIZE=<w>x<h>` asks for, if any.
+fn requested_window() -> Option<(i32, i32)> {
+    static SIZE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let text = std::env::var("VICTORY_WINDOW_SIZE").ok()?;
+        let (w, h) = text.split_once('x')?;
+        let size: (i32, i32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+        (size.0 > 0 && size.1 > 0).then_some(size)
+    })
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
@@ -159,6 +223,39 @@ fn hook(hwnd: HWND) {
         let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        if requested_fullscreen() && wm::GetParent(hwnd).is_null() {
+            let (sw, sh) = (
+                wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            );
+            if sw > 0 && sh > 0 {
+                let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
+                let popup = (style
+                    & !(wm::WS_CAPTION
+                        | wm::WS_THICKFRAME
+                        | wm::WS_SYSMENU
+                        | wm::WS_BORDER
+                        | wm::WS_DLGFRAME))
+                    | wm::WS_POPUP
+                    | wm::WS_VISIBLE;
+                let _ = wm::SetWindowLongW(hwnd, wm::GWL_STYLE, popup as i32);
+                let ex = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE) as u32;
+                let _ = wm::SetWindowLongPtrW(
+                    hwnd,
+                    wm::GWL_EXSTYLE,
+                    (ex | wm::WS_EX_APPWINDOW) as isize,
+                );
+                let _ = wm::SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    sw,
+                    sh,
+                    wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+                );
+            }
+        }
     }
 }
 
@@ -168,6 +265,28 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Keep borderless fullscreen locked even if the title calls SetWindowPos /
+    // MoveWindow to shrink the window back to its render resolution.
+    if message == wm::WM_WINDOWPOSCHANGING && lparam != 0 && requested_fullscreen() {
+        // SAFETY: `lparam` points to a mutable WINDOWPOS for this message.
+        unsafe {
+            let (sw, sh) = (
+                wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            );
+            if sw > 0 && sh > 0 {
+                let wp = &mut *(lparam as *mut wm::WINDOWPOS);
+                if wp.flags & wm::SWP_NOMOVE == 0 {
+                    wp.x = 0;
+                    wp.y = 0;
+                }
+                if wp.flags & wm::SWP_NOSIZE == 0 {
+                    wp.cx = sw;
+                    wp.cy = sh;
+                }
+            }
+        }
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {

@@ -1,8 +1,9 @@
-//! (Neptune) The diagnostics build exports the two symbols by which the D3D12 loader finds a
-//! redistributable runtime and debug layer beside the executable (`D3D12\`): the debug layer
-//! Windows installs is older than its D3D12 runtime on some PCs, and a device is then refused.
+//! Exports the two symbols by which `d3d12.dll` finds the redistributable
+//! Agility SDK runtime (`D3D12\D3D12Core.dll` 1.620.2) beside `victory.exe`.
+//! Needed on Windows 10 (whose inbox D3D12 stops at SM 6.5, rejecting all
+//! SM 6.6 root signatures) in release builds as well as diagnostics builds.
 fn main() {
-    if std::env::var_os("CARGO_FEATURE_DIAGNOSTICS").is_some() {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKVersion,DATA");
         println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKPath,DATA");
     }

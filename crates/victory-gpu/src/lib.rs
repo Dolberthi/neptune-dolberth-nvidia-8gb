@@ -25,6 +25,14 @@ pub mod device;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod cores;
+#[cfg(windows)]
+mod placement;
+#[cfg(windows)]
+mod stamp;
+#[cfg(windows)]
+mod turbo;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]
@@ -32,6 +40,7 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 pub mod frametime;
+mod heap_pass;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -64,6 +73,8 @@ mod ramline;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod smart_back;
+#[cfg(windows)]
 mod windowup;
 #[cfg(windows)]
 mod tiles;
@@ -75,10 +86,14 @@ mod texture;
 #[cfg(windows)]
 pub mod titlemem;
 #[cfg(windows)]
+mod upscale;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use upscale::hook as upscaler_dispatch;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

@@ -76,3 +76,14 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Local runtime, logs, tests, personal launchers and Agility SDK copies
+/testes/
+/D3D12/
+ambient.txt
+*.log
+*.err
+*.dmp
+jogar-neptune.ps1
+teste-neptune.ps1
+PUBLICAR-GITHUB.md

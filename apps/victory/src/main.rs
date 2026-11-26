@@ -190,22 +190,22 @@ enum Console {
     SeriesS,
 }
 
-/// (Neptune) Diagnostics builds: the redistributable D3D12 runtime and debug layer in `D3D12\`
-/// beside the executable are used if they are there (`build.rs` exports these two; the
-/// version is the middle number of the package's, 1.620.2).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Exports for the DirectX 12 Agility SDK runtime in `D3D12\` beside `victory.exe`
+/// (1.620.2 -> `D3D12SDKVersion = 620`). Required on Windows 10 for SM 6.6 in
+/// release builds as well as diagnostics builds (`build.rs` exports both).
+#[cfg(windows)]
 #[unsafe(no_mangle)]
 #[used]
 pub static D3D12SDKVersion: u32 = 620;
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 #[repr(transparent)]
 pub struct SdkPath(*const u8);
 // SAFETY: a pointer to a constant string.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 unsafe impl Sync for SdkPath {}
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 #[unsafe(no_mangle)]
 #[used]
 pub static D3D12SDKPath: SdkPath = SdkPath(b".\\D3D12\\\0".as_ptr());

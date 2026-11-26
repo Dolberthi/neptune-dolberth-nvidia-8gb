@@ -45,6 +45,35 @@ pub fn run(
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     victory_hle::runtime::set_image_size(image.base(), image.info().size_of_image as usize);
+    // `VICTORY_RESOLUTION=1280x720` (or 960x540 / 1920x1080): cap the title's
+    // resolution ladder so Series X renders at that internal size instead of 4K.
+    let resolution = std::env::var("VICTORY_RESOLUTION").ok().and_then(|text| {
+        let (w, h) = text.split_once('x')?;
+        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+    });
+    if let Some((width, height)) = resolution {
+        let base = image.base();
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image is mapped for `size` bytes; the cap rewrites it
+        // before any title code runs.
+        let writable =
+            unsafe { victory_loader::make_writable(base as *const core::ffi::c_void, size) };
+        if writable {
+            // SAFETY: writable for `size` bytes, as above.
+            let changed =
+                unsafe { victory_game::output::cap_ladder(base as *mut u8, size, width, height) };
+            println!("resolution     {changed} ladder entry(ies) capped to {width}x{height}");
+            // SAFETY: readable for `size` bytes.
+            if let Some(at) = unsafe { victory_game::output::assert_site(base as usize, size) } {
+                // SAFETY: `at` lies inside the image, made writable above.
+                unsafe { std::ptr::write_bytes(at as *mut u8, 0x90, 1) };
+                println!("resolution     int3 at {at:#x} patched to nop");
+            }
+        } else {
+            eprintln!("resolution     the image could not be made writable; no patch");
+        }
+    }
+    keep_title_watchdog_kicked(image.base());
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -350,4 +379,62 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// `VICTORY_TITLE_WATCHDOG=0`: keeps the title's own 30 s hang watchdog from
+/// firing while shaders/pipelines compile or the world streams in.
+fn keep_title_watchdog_kicked(base: usize) {
+    const TRAP_RVA: usize = 0x2215c35;
+    const KICK_RVA: usize = 0x71b6331;
+    // movl $0, 0x0
+    const TRAP: [u8; 11] = [0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0];
+    if std::env::var_os("VICTORY_TITLE_WATCHDOG").is_none_or(|v| v != "0") {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+            PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        };
+        let query = |at: usize| {
+            // SAFETY: plain data filled in by the query; any address may be asked.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe {
+                VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>())
+            };
+            (n != 0).then_some(info)
+        };
+        let trap_at = base + TRAP_RVA;
+        let Some(trap) = query(trap_at) else { return };
+        if trap.State != MEM_COMMIT
+            || (trap.BaseAddress as usize + trap.RegionSize) < trap_at + TRAP.len()
+        {
+            return;
+        }
+        // SAFETY: committed memory of the mapped title image, checked above.
+        let here = unsafe { std::slice::from_raw_parts(trap_at as *const u8, TRAP.len()) };
+        if here != TRAP {
+            println!("title watchdog: not the build it was measured on; left armed");
+            return;
+        }
+        let kick_at = base + KICK_RVA;
+        let writable =
+            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        let Some(kick) = query(kick_at) else { return };
+        if kick.State != MEM_COMMIT || kick.Protect & writable == 0 {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("victory-title-watchdog".into())
+            .spawn(move || loop {
+                // SAFETY: committed writable byte of the title image, checked above.
+                unsafe { (kick_at as *mut u8).write_volatile(1) };
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            });
+        if spawned.is_ok() {
+            println!("title watchdog: kept kicked (VICTORY_TITLE_WATCHDOG=0)");
+        }
+    }
 }

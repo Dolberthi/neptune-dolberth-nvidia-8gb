@@ -843,85 +843,188 @@ impl Layout {
             // every row, including mip tails: no run reaches the lowest bit a
             // row may flip, since that bit is the row's own, which no column
             // sets (XTP checks that for every pattern; see the test here).
-            let mut runs = Vec::new();
-            let mut first_linear = 0;
-            let mut first_tiled = self.column_xor(flips, m, 0);
-            for x in 1..m.width {
-                let offset = self.column_xor(flips, m, x);
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) as u64 {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
+            // Reuse a thread-local Vec to avoid per-mip heap allocations.
+            std::thread_local! {
+                static FLIP_RUNS: std::cell::RefCell<Vec<(u64, usize, usize)>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
             }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
-            for z in 0..depth {
-                let (s, _) = self.split(first + z);
-                let base = u64::from(s) * self.slice_size + m.offset;
-                for y in 0..m.height {
-                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                    let (row, xor) = self.row_xor(flips, m, y, first + z);
-                    for &(tiled, linear, len) in &runs {
-                        let at = base + row + (tiled ^ u64::from(xor));
-                        copy_run::<DETILE>(src, dst, at as usize, linear_row + linear, len);
+            return FLIP_RUNS.with(|cell| {
+                let mut runs = cell.borrow_mut();
+                runs.clear();
+                let mut first_linear = 0;
+                let mut first_tiled = self.column_xor(flips, m, 0);
+                for x in 1..m.width {
+                    let offset = self.column_xor(flips, m, x);
+                    let at = x as usize * n;
+                    if offset != first_tiled + (at - first_linear) as u64 {
+                        runs.push((first_tiled, first_linear, at - first_linear));
+                        first_tiled = offset;
+                        first_linear = at;
                     }
                 }
-            }
-            return Ok(());
+                runs.push((first_tiled, first_linear, bytes - first_linear));
+                // Check if all runs share a fixed power-of-two chunk size for
+                // unrolled SIMD-friendly fixed-size copies (16/32/64 bytes).
+                let uniform = runs.first().map(|r| r.2).filter(|&sz| {
+                    matches!(sz, 16 | 32 | 64) && runs.iter().all(|&(_, _, l)| l == sz)
+                });
+                let max_col_tiled = runs
+                    .iter()
+                    .map(|&(t, _, l)| t as usize + l)
+                    .max()
+                    .unwrap_or(0);
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_mut_ptr();
+                for z in 0..depth {
+                    let (s, _) = self.split(first + z);
+                    let base = u64::from(s) * self.slice_size + m.offset;
+                    for y in 0..m.height {
+                        let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                        let (row, xor) = self.row_xor(flips, m, y, first + z);
+                        let row_base = base + row;
+                        let xor64 = u64::from(xor);
+                        // Upper bound of (tiled ^ xor): tiled + xor >= (tiled ^ xor).
+                        let row_upper = row_base as usize + max_col_tiled + xor as usize;
+                        if row_upper <= tiled_len && linear_row + bytes <= linear_len {
+                            match uniform {
+                                Some(64) => {
+                                    // SAFETY: `row_upper <= tiled_len` and `linear_row + bytes <= linear_len`.
+                                    unsafe {
+                                        copy_flips_fixed::<64, DETILE>(
+                                            src_ptr, dst_ptr, &runs, row_base, xor64, linear_row,
+                                        );
+                                    }
+                                }
+                                Some(32) => unsafe {
+                                    copy_flips_fixed::<32, DETILE>(
+                                        src_ptr, dst_ptr, &runs, row_base, xor64, linear_row,
+                                    );
+                                },
+                                Some(16) => unsafe {
+                                    copy_flips_fixed::<16, DETILE>(
+                                        src_ptr, dst_ptr, &runs, row_base, xor64, linear_row,
+                                    );
+                                },
+                                _ => {
+                                    for &(tiled, linear, len) in runs.iter() {
+                                        let at = (row_base + (tiled ^ xor64)) as usize;
+                                        // SAFETY: `at + len <= row_upper <= tiled_len`,
+                                        // `linear_row + linear + len <= linear_row + bytes <= linear_len`.
+                                        unsafe {
+                                            if DETILE {
+                                                std::ptr::copy_nonoverlapping(
+                                                    src_ptr.add(at),
+                                                    dst_ptr.add(linear_row + linear),
+                                                    len,
+                                                );
+                                            } else {
+                                                std::ptr::copy_nonoverlapping(
+                                                    src_ptr.add(linear_row + linear),
+                                                    dst_ptr.add(at),
+                                                    len,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            for &(tiled, linear, len) in runs.iter() {
+                                let at = row_base + (tiled ^ xor64);
+                                copy_run::<DETILE>(src, dst, at as usize, linear_row + linear, len);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
+        std::thread_local! {
+            static LIN_RUNS: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
-        // A mip can end partway through the last run. Check the other runs
-        // once so each row can copy them as fixed-size chunks.
-        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
-            body.iter()
-                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
-        });
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
-            let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
-                } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    match chunk_size {
-                        Some(8) if tiled_row.is_multiple_of(8) => {
-                            copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(16) if tiled_row.is_multiple_of(16) => {
-                            copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(32) if tiled_row.is_multiple_of(32) => {
-                            copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
+        LIN_RUNS.with(|cell| {
+            let mut runs = cell.borrow_mut();
+            runs.clear();
+            if !linear {
+                let mut first_linear = 0;
+                let mut first_tiled = self.column(m, 0) as usize;
+                for x in 1..m.width {
+                    let offset = self.column(m, x) as usize;
+                    let at = x as usize * n;
+                    if offset != first_tiled + (at - first_linear) {
+                        runs.push((first_tiled, first_linear, at - first_linear));
+                        first_tiled = offset;
+                        first_linear = at;
                     }
-                    copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+                }
+                runs.push((first_tiled, first_linear, bytes - first_linear));
+            }
+            // A mip can end partway through the last run. Check the other runs
+            // once so each row can copy them as fixed-size chunks.
+            let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+            let chunk_size = body.first().map(|run| run.2).filter(|&size| {
+                body.iter()
+                    .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
+            });
+            for z in 0..depth {
+                let (s, inner) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    if linear {
+                        let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                        copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
+                    } else {
+                        let tiled_row = (base + self.row(m, y, inner)) as usize;
+                        match chunk_size {
+                            Some(8) if tiled_row.is_multiple_of(8) => {
+                                copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
+                            }
+                            Some(16) if tiled_row.is_multiple_of(16) => {
+                                copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
+                            }
+                            Some(32) if tiled_row.is_multiple_of(32) => {
+                                copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
+                            }
+                            Some(64) if tiled_row.is_multiple_of(64) => {
+                                copy_runs::<64, DETILE>(src, dst, body, tiled_row, linear_row)
+                            }
+                            _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
+                        }
+                        copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+                    }
                 }
             }
+            Ok(())
+        })
+    }
+}
+
+/// Unchecked fixed-size chunk copy for Xbox Scarlett XOR-flipped tile rows.
+/// Caller guarantees all computed tiled and linear ranges are in-bounds.
+#[inline(always)]
+unsafe fn copy_flips_fixed<const N: usize, const DETILE: bool>(
+    src: *const u8,
+    dst: *mut u8,
+    runs: &[(u64, usize, usize)],
+    row_base: u64,
+    xor64: u64,
+    linear_row: usize,
+) {
+    for &(tiled, linear, _) in runs {
+        let at = (row_base + (tiled ^ xor64)) as usize;
+        // SAFETY: validated by caller before entering the row loop.
+        unsafe {
+            if DETILE {
+                std::ptr::copy_nonoverlapping(src.add(at), dst.add(linear_row + linear), N);
+            } else {
+                std::ptr::copy_nonoverlapping(src.add(linear_row + linear), dst.add(at), N);
+            }
         }
-        Ok(())
     }
 }
 

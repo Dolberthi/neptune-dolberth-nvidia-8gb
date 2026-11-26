@@ -220,9 +220,14 @@ extern "system" fn create_queue(
 
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let floor = std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(0, |mb| mb.clamp(16, 256) << 20);
+    let effective = u64::from(size).max(floor);
+    tracing::info!(size, effective, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = effective;
     }
     S_OK
 }

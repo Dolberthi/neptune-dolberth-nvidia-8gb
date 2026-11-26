@@ -153,6 +153,22 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+        // Standalone Series S upscaler: route console `ffxDispatch` through our
+        // built-in sharp GPU upscaler when no external `VICTORY_FSR_DLL` is set.
+        if (name as usize) >= 0x1_0000
+            && narrow(name) == "ffxDispatch"
+            && !crate::modules::fidelityfx::enabled()
+            && runtime::image_path(module as usize).is_some_and(|p| {
+                p.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("fidelityfx_upscaler")
+            })
+        {
+            let original = host::get_proc_address(module, name);
+            if !original.is_null() {
+                return victory_gpu::upscaler_dispatch(original as usize) as *mut c_void;
+            }
+        }
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.

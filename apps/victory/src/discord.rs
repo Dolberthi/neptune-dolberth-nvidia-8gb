@@ -1,4 +1,4 @@
-//! (Neptune) Discord Rich Presence while a title runs: "Playing Grand Theft Auto VI" with
+//! (Neptune) Discord Rich Presence while a title runs, with
 //! the time played, through the Discord client's own pipe on this PC (`\\.\pipe\discord-ipc-N`).
 //! Nothing goes over the network from here, and nothing happens if Discord is not running.
 //! `VICTORY_DISCORD=0` turns it off; `VICTORY_DISCORD_APP` names another application id.
@@ -41,7 +41,7 @@ fn connect(application: &str, started: u64) -> Option<std::fs::File> {
             continue;
         }
         let activity = format!(
-            r#"{{"cmd":"SET_ACTIVITY","args":{{"pid":{},"activity":{{"details":"Neptune (VIctory Edit.)","state":"In game","timestamps":{{"start":{started}}},"assets":{{"large_image":"logo","large_text":"Grand Theft Auto VI"}}}}}},"nonce":"neptune-{started}"}}"#,
+            r#"{{"cmd":"SET_ACTIVITY","args":{{"pid":{},"activity":{{"details":"Neptune HyperEngine by Dolberth","state":"Running title","timestamps":{{"start":{started}}},"assets":{{"large_image":"logo","large_text":"Neptune HyperEngine by Dolberth"}}}}}},"nonce":"neptune-{started}"}}"#,
             std::process::id()
         );
         if pipe.write_all(&frame(1, &activity)).is_ok() && answer(&mut pipe).is_ok() {

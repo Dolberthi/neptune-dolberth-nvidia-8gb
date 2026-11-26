@@ -160,6 +160,45 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 }
+
+// One thread loads each requested mesh record, then lane 0 charges the shared
+// list budget in draw order (32 mesh indirects clamped in 1 wave + 1 barrier).
+#define MESH_BATCH_SIZE 32
+groupshared uint3 mesh_args[MESH_BATCH_SIZE];
+groupshared uint mesh_requested[MESH_BATCH_SIZE];
+
+[RootSignature(RS)]
+[numthreads(MESH_BATCH_SIZE, 1, 1)]
+void mesh_batch(uint lane : SV_GroupIndex) {
+    uint active = min(count_buf.Load(0), uint(MESH_BATCH_SIZE));
+    if (lane < active) {
+        uint3 raw = src_args.Load3(count_buf.Load(4 + lane * 4));
+        mesh_requested[lane] = raw.x;
+        mesh_args[lane] = min(raw, uint3(65535u, 1u, 1u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0) {
+        uint spent = min(budget.Load(0), BUDGET);
+        uint largest = budget.Load(4);
+        uint total = budget.Load(8);
+        for (uint i = 0; i < active; i++) {
+            uint requested = mesh_requested[i];
+            largest = max(largest, requested);
+            total += min(requested, 1u << 24);
+            uint3 groups = mesh_args[i];
+            uint cost = groups.x * groups.y * groups.z * 128u;
+            if (cost > BUDGET - spent) {
+                mesh_args[i] = uint3(0, 0, 0);
+            }
+            spent = min(spent + cost, BUDGET);
+        }
+        budget.Store3(0, uint3(spent, largest, total));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < active) {
+        dst_args.Store3(lane * 12, mesh_args[lane]);
+    }
+}
 "#;
 
 struct Clamp {
@@ -190,7 +229,81 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+const MESH_BATCH_SIZE: u32 = 32;
+pub(crate) const MESH_STRIDE: u32 = 12;
+
+/// An open batch of up to 32 consecutive indirect mesh draws in one host list.
+/// The first draw records ONE `mesh_batch` compute clamp; the next 31 draws
+/// append their argument offsets to the mapped upload buffer with zero extra
+/// compute dispatches or UAV barriers.
+pub(crate) struct MeshBatch {
+    copy: u64,
+    offsets: usize,
+    used: u32,
+    bounded: ID3D12Resource,
+}
+
+impl MeshBatch {
+    pub(crate) fn new(list: &HostList, copy: u64, src: &ID3D12Resource) -> Option<Self> {
+        static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+        let clamp = CLAMP
+            .get_or_init(|| {
+                let device = &host()?.device;
+                match make_entry(device, s!("mesh_batch")) {
+                    Ok(clamp) => {
+                        tracing::info!(records = MESH_BATCH_SIZE, "grouped mesh argument clamp enabled");
+                        Some(clamp)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "grouped mesh argument clamp unavailable");
+                        None
+                    }
+                }
+            })
+            .as_ref()?;
+        let budget = list.budget()?;
+        let bounded = list.indirect_scratch(u64::from(MESH_BATCH_SIZE * MESH_STRIDE))?;
+        let (offsets_gpu, offsets) = list.scratch(u64::from((MESH_BATCH_SIZE + 1) * 4))?;
+        // SAFETY: the list owns this mapped slice until the GPU finishes it.
+        unsafe { offsets.cast::<u32>().write(0) };
+        // SAFETY: live buffer resources.
+        let (src_gpu, dst_gpu) =
+            unsafe { (src.GetGPUVirtualAddress(), bounded.GetGPUVirtualAddress()) };
+        record_gpu_clamp(clamp, &list.list, &bounded, [0; 6], [src_gpu, offsets_gpu, dst_gpu, budget], 1);
+        Some(Self {
+            copy,
+            offsets: offsets as usize,
+            used: 0,
+            bounded,
+        })
+    }
+
+    pub(crate) fn accepts(&self, copy: u64) -> bool {
+        self.copy == copy && self.used < MESH_BATCH_SIZE
+    }
+
+    pub(crate) fn append(&mut self, offset: u32) -> (ID3D12Resource, u64) {
+        let at = self.used;
+        self.used += 1;
+        let offsets = self.offsets as *mut u32;
+        // SAFETY: mapped upload slice owned by this open list; `accepts()` bounds `at`.
+        unsafe {
+            offsets.add(at as usize + 1).write(offset);
+            offsets.write(self.used);
+        }
+        (self.bounded.clone(), u64::from(at * MESH_STRIDE))
+    }
+
+    pub(crate) fn finish(self, list: &HostList) {
+        done(list, &self.bounded);
+    }
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_entry(device, s!("main"))
+}
+
+fn make_entry(device: &ID3D12Device, entry: windows::core::PCSTR) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -201,7 +314,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             s!("clamp"),
             None,
             None,
-            s!("main"),
+            entry,
             s!("cs_5_1"),
             0,
             0,
@@ -400,6 +513,25 @@ fn record_clamp_as(
         None => (src_gpu, 0u32, 0u32),
     };
     let constants = [kind, stride, records, args_offset, has_count | how, count_offset];
+    record_gpu_clamp(
+        c,
+        l,
+        dst,
+        constants,
+        [src_gpu, count_gpu, dst_gpu, budget],
+        records.div_ceil(64),
+    );
+    true
+}
+
+fn record_gpu_clamp(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    constants: [u32; 6],
+    [src_gpu, count_gpu, dst_gpu, budget]: [u64; 4],
+    groups: u32,
+) {
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -432,7 +564,7 @@ fn record_clamp_as(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
+        if groups > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -440,11 +572,10 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.Dispatch(groups, 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
     }
-    true
 }
 
 /// (Neptune) A record clamped ahead of its list ([`record_ahead`]): the

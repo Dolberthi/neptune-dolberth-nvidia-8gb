@@ -3,6 +3,9 @@
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
 
+/// The title's resolution ladder cap (`VICTORY_RESOLUTION`), from
+/// soldsawn/victory-nvidia-8gb `037ef58` (by DKTTT).
+pub mod output;
 pub mod sgd5;
 
 /// A specific build of the title executable we know how to run.
