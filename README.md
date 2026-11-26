@@ -93,6 +93,8 @@ This produces `target\release\victory.exe`.
 .\neptune-diag.ps1
 ```
 
+**Hotkeys:** `F9` mouse look · `F10` toggle overlay · `F11` / `Alt+Enter` toggle borderless fullscreen ↔ windowed · `F12` screenshot
+
 ---
 
 ## ◆ Key Environment Switches

@@ -10077,12 +10077,94 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
+/// Toggles `hwnd` between borderless fullscreen (`WS_POPUP`) and windowed
+/// (`WS_OVERLAPPEDWINDOW`) on `F11` or `Alt+Enter`. Runs exclusively on the
+/// window owner thread (`victory-window`).
+unsafe fn toggle_fullscreen(hwnd: HWND) {
+    use std::cell::Cell;
+    use windows_sys::Win32::Foundation::{HWND as SysHwnd, RECT as SysRect};
+    use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+
+    thread_local! {
+        static SAVED_RECT: Cell<Option<SysRect>> = const { Cell::new(None) };
+    }
+
+    let raw = hwnd.0 as SysHwnd;
+    let style = unsafe { wm::GetWindowLongPtrW(raw, wm::GWL_STYLE) } as u32;
+    let is_fullscreen = (style & wm::WS_OVERLAPPEDWINDOW) == 0;
+    let (sw, sh) = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
+
+    if is_fullscreen {
+        let mut r = SAVED_RECT.with(Cell::get).unwrap_or_else(|| {
+            let cw = ((sw * 2) / 3).clamp(960, 1600);
+            let ch = (cw * 9) / 16;
+            let mut adj = SysRect { left: 0, top: 0, right: cw, bottom: ch };
+            unsafe { wm::AdjustWindowRect(&mut adj, wm::WS_OVERLAPPEDWINDOW, 0) };
+            let ww = adj.right - adj.left;
+            let wh = adj.bottom - adj.top;
+            let x = ((sw - ww) / 2).max(0);
+            let y = ((sh - wh) / 2).max(0);
+            SysRect { left: x, top: y, right: x + ww, bottom: y + wh }
+        });
+        // Keep the title bar reachable on screen.
+        if r.right <= r.left || r.bottom <= r.top {
+            r = SysRect { left: 80, top: 60, right: 1360, bottom: 820 };
+        }
+        unsafe {
+            wm::SetWindowLongPtrW(raw, wm::GWL_STYLE, (wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE) as isize);
+            wm::SetWindowLongPtrW(raw, wm::GWL_EXSTYLE, 0);
+            wm::SetWindowPos(
+                raw,
+                wm::HWND_TOP,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
+            );
+        }
+    } else {
+        let mut cur = SysRect { left: 0, top: 0, right: 0, bottom: 0 };
+        if unsafe { wm::GetWindowRect(raw, &mut cur) } != 0 {
+            SAVED_RECT.with(|c| c.set(Some(cur)));
+        }
+        if sw > 0 && sh > 0 {
+            unsafe {
+                wm::SetWindowLongPtrW(raw, wm::GWL_STYLE, (wm::WS_POPUP | wm::WS_VISIBLE) as isize);
+                wm::SetWindowLongPtrW(raw, wm::GWL_EXSTYLE, wm::WS_EX_APPWINDOW as isize);
+                wm::SetWindowPos(
+                    raw,
+                    wm::HWND_TOP,
+                    0,
+                    0,
+                    sw,
+                    sh,
+                    wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    const WM_KEYDOWN_MSG: u32 = 0x0100;
+    const WM_SYSKEYDOWN_MSG: u32 = 0x0104;
+    const VK_F11: usize = 0x7A;
+    const VK_RETURN: usize = 0x0D;
+    let fresh_press = (lparam.0 & (1 << 30)) == 0;
+    if fresh_press
+        && ((message == WM_KEYDOWN_MSG && wparam.0 == VK_F11)
+            || (message == WM_SYSKEYDOWN_MSG && wparam.0 == VK_RETURN))
+    {
+        // SAFETY: runs on the thread that owns `hwnd`.
+        unsafe { toggle_fullscreen(hwnd) };
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
