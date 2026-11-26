@@ -2087,7 +2087,8 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
-    slot_evict(video, idle_ms, IDLE_FRAMES);
+    slot_evict(&all, video, idle_ms, IDLE_FRAMES);
+    drop(all);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2149,7 +2150,7 @@ fn slot_need(budget: u64, used: u64, percent: u64, cap: u64) -> u64 {
 /// (`crate::host::retire`). A draw that reads a slot makes the copy again
 /// from title memory ([`hosted`]).
 #[cfg(windows)]
-fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
+fn slot_evict(all: &std::collections::BTreeSet<usize>, video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let (Some((percent, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
         return;
@@ -2160,7 +2161,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     }
     let mut copies = Vec::new();
     let mut raws = std::collections::HashMap::new();
-    for &at in textures().iter() {
+    for &at in all.iter() {
         // SAFETY: as in `pressure_victims`.
         let r = unsafe { &*(at as *const Resource) };
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
