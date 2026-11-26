@@ -78,12 +78,13 @@ This produces `target\release\victory.exe`.
 ## ◆ Usage
 
 ```powershell
-# Launch with the 8 GB NVIDIA / 16 GB RAM profile
-# Pass -WarmShaders once after building or changing shader translator switches
-.\run-neptune.ps1 -Title 'D:\Path\To\Your\title.exe' -WarmShaders
-
-# Subsequent launches
+# Launch with the 8 GB NVIDIA / 16 GB RAM profile.
+# First launch automatically warms the shader cache offline once (~3-5 min) to prevent
+# live compilation stutter; all subsequent launches start immediately.
 .\run-neptune.ps1 -Title 'D:\Path\To\Your\title.exe'
+
+# Force re-warming shaders (or skip auto-warm with -SkipWarm)
+.\run-neptune.ps1 -Title 'D:\Path\To\Your\title.exe' -WarmShaders
 
 # Higher texture cap (12 GB+ VRAM) or windowed mode
 .\run-neptune.ps1 -Title 'D:\Path\To\Your\title.exe' -TextureMaxDim 2048 -Window '1600x900'
